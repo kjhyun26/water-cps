@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>정수장 MiniCPS 코드 정리</title>
+<style>
+:root {
+  --bg: #fbfaf7; --surface: #ffffff; --surface-2: #f3f1ec; --text: #1f1e1b; --muted: #5f5d57;
+  --border: #dedad1; --accent: #185fa5; --accent-bg: #e6f1fb; --physical: #0f6e56; --physical-bg: #e1f5ee;
+  --control: #534ab7; --control-bg: #eeedfe; --warn: #854f0b; --warn-bg: #faeeda; --code-bg: #f3f1ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #171716; --surface: #1f1f1d; --surface-2: #2a2a27; --text: #ecebe6; --muted: #aaa8a0;
+    --border: #3a3936; --accent: #85b7eb; --accent-bg: #0c2c4a; --physical: #5dcaa5; --physical-bg: #08362c;
+    --control: #afa9ec; --control-bg: #26215c; --warn: #fac775; --warn-bg: #412402; --code-bg: #262624;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #171716; --surface: #1f1f1d; --surface-2: #2a2a27; --text: #ecebe6; --muted: #aaa8a0;
+  --border: #3a3936; --accent: #85b7eb; --accent-bg: #0c2c4a; --physical: #5dcaa5; --physical-bg: #08362c;
+  --control: #afa9ec; --control-bg: #26215c; --warn: #fac775; --warn-bg: #412402; --code-bg: #262624;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; line-height: 1.7; }
+main { max-width: 900px; margin: 0 auto; padding: 32px 16px 80px; }
+h1 { font-size: 28px; font-weight: 600; margin: 0 0 6px; }
+h2 { font-size: 21px; font-weight: 600; margin: 48px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+h3 { font-size: 17px; font-weight: 600; margin: 28px 0 8px; }
+p, li { font-size: 15.5px; }
+.lead { color: var(--muted); margin: 0 0 20px; }
+nav { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin: 20px 0; }
+nav ol { margin: 0; padding-left: 20px; columns: 2; column-gap: 24px; }
+nav li { font-size: 14.5px; }
+a { color: var(--accent); }
+table { width: 100%; border-collapse: collapse; margin: 10px 0 18px; font-size: 14.5px; background: var(--surface); }
+th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+th { background: var(--surface-2); font-weight: 600; }
+.table-wrap { overflow-x: auto; }
+code { font-family: "JetBrains Mono", Consolas, "D2Coding", monospace; font-size: 13.5px; background: var(--code-bg);
+  padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; overflow-x: auto;
+  font-size: 13.5px; line-height: 1.55; }
+pre code { background: none; padding: 0; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin: 14px 0; }
+.card h3 { margin-top: 2px; }
+.tag { display: inline-block; font-size: 12.5px; padding: 1px 8px; border-radius: 6px; margin-right: 6px; font-weight: 600; }
+.tag-physical { background: var(--physical-bg); color: var(--physical); }
+.tag-control { background: var(--control-bg); color: var(--control); }
+.tag-tool { background: var(--accent-bg); color: var(--accent); }
+.note { background: var(--warn-bg); color: var(--text); border-radius: 8px; padding: 10px 14px; font-size: 14.5px; }
+.note strong { color: var(--warn); }
+.meta { color: var(--muted); font-size: 13.5px; }
+figure { margin: 16px 0; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+figcaption { color: var(--muted); font-size: 13.5px; margin-top: 6px; }
+svg text { font-family: inherit; }
+.svg-box { fill: var(--surface-2); stroke: var(--border); }
+.svg-physical { fill: var(--physical-bg); stroke: var(--physical); }
+.svg-control { fill: var(--control-bg); stroke: var(--control); }
+.svg-hmi { fill: var(--accent-bg); stroke: var(--accent); }
+.svg-title { fill: var(--text); font-size: 14px; font-weight: 600; }
+.svg-sub { fill: var(--muted); font-size: 12px; }
+.svg-line { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+.svg-dash { stroke: var(--muted); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+@media (max-width: 640px) { nav ol { columns: 1; } h1 { font-size: 24px; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>정수장 MiniCPS 코드 정리</h1>
+<p class="lead">약품 주입 구간의 물리·제어 계층 구현을 파일 단위로 설명한다. 기준 코드: <code>water_cps/</code>, 기준일 2026-11-24.
+명세와 시험 기준은 <a href="261117-MiniCPS_제어공정_설계.md">설계 문서</a>에 있다.</p>
+
+<nav>
+<ol>
+  <li><a href="#overview">전체 구조</a></li>
+  <li><a href="#startup">시작 순서</a></li>
+  <li><a href="#tags">태그와 값이 오가는 길</a></li>
+  <li><a href="#files">파일별 설명</a></li>
+  <li><a href="#process">공정 수식</a></li>
+  <li><a href="#failure">실패를 다루는 규칙</a></li>
+  <li><a href="#tests">시험</a></li>
+  <li><a href="#next">다음 단계에서 고칠 곳</a></li>
+</ol>
+</nav>
+
+<h2 id="overview">1. 전체 구조</h2>
+
+<p>프로그램 여섯 개가 각자 돈다. 값이 오가는 길은 둘이다.</p>
+<ul>
+  <li><strong>물리 층</strong>: SQLite 파일 하나(<code>water_cps.sqlite</code>)의 표. 센서와 펌프·밸브가 장치에 전선으로 연결된 것을 흉내 낸다. 공정이 센서값을 쓰면 PLC가 읽고, PLC가 펌프 명령을 쓰면 공정이 읽는다.</li>
+  <li><strong>통신 층</strong>: EtherNet/IP(산업용 통신 규격). 장치마다 서버가 하나 있고 다른 장치가 거기서 읽거나 쓴다. Mininet 가상 네트워크 위에서 돈다.</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 760 360" width="100%" role="img" aria-labelledby="diagram-title">
+  <title id="diagram-title">HMI, PLC 세 대, SIS, 상태 표, 공정의 연결</title>
+  <rect class="svg-hmi" x="300" y="12" width="160" height="50" rx="8"/>
+  <text class="svg-title" x="380" y="35" text-anchor="middle">HMI</text>
+  <text class="svg-sub" x="380" y="52" text-anchor="middle">화면 · dose · sis reset</text>
+  <line class="svg-dash" x1="380" y1="62" x2="380" y2="96"/>
+  <line class="svg-dash" x1="90" y1="96" x2="670" y2="96"/>
+  <text class="svg-sub" x="560" y="88">EtherNet/IP (스위치 s1)</text>
+  <g>
+    <line class="svg-dash" x1="90" y1="96" x2="90" y2="120"/>
+    <line class="svg-dash" x1="283" y1="96" x2="283" y2="120"/>
+    <line class="svg-dash" x1="476" y1="96" x2="476" y2="120"/>
+    <line class="svg-dash" x1="669" y1="96" x2="669" y2="120"/>
+  </g>
+  <rect class="svg-control" x="20" y="120" width="140" height="58" rx="8"/>
+  <text class="svg-title" x="90" y="144" text-anchor="middle">PLC1</text>
+  <text class="svg-sub" x="90" y="162" text-anchor="middle">수위 3.3~3.7 m</text>
+  <rect class="svg-control" x="213" y="120" width="140" height="58" rx="8"/>
+  <text class="svg-title" x="283" y="144" text-anchor="middle">PLC2</text>
+  <text class="svg-sub" x="283" y="162" text-anchor="middle">유량 × 주입률</text>
+  <rect class="svg-control" x="406" y="120" width="140" height="58" rx="8"/>
+  <text class="svg-title" x="476" y="144" text-anchor="middle">PLC3</text>
+  <text class="svg-sub" x="476" y="162" text-anchor="middle">탁도 30분 경보</text>
+  <rect class="svg-control" x="599" y="120" width="140" height="58" rx="8"/>
+  <text class="svg-title" x="669" y="144" text-anchor="middle">SIS</text>
+  <text class="svg-sub" x="669" y="162" text-anchor="middle">pH 벗어나면 차단</text>
+  <path class="svg-dash" d="M 160 140 L 213 140"/>
+  <text class="svg-sub" x="186" y="134" text-anchor="middle">유량</text>
+  <g>
+    <line class="svg-line" x1="90" y1="178" x2="90" y2="222"/>
+    <line class="svg-line" x1="283" y1="178" x2="283" y2="222"/>
+    <line class="svg-line" x1="476" y1="178" x2="476" y2="222"/>
+    <line class="svg-line" x1="669" y1="178" x2="669" y2="222"/>
+  </g>
+  <rect class="svg-box" x="20" y="222" width="719" height="44" rx="8"/>
+  <text class="svg-title" x="380" y="245" text-anchor="middle">상태 표 (SQLite, 물리 층)</text>
+  <text class="svg-sub" x="380" y="260" text-anchor="middle">LIT101 · FIT102 · AIT101 · P101 · P201 · AIT301 · AIT202 · XV201 · SIM_TIME</text>
+  <line class="svg-line" x1="380" y1="266" x2="380" y2="292"/>
+  <rect class="svg-physical" x="240" y="292" width="280" height="56" rx="8"/>
+  <text class="svg-title" x="380" y="316" text-anchor="middle">공정 프로그램</text>
+  <text class="svg-sub" x="380" y="334" text-anchor="middle">수위 · pH · 5시간 뒤 침전수 탁도</text>
+</svg>
+<figcaption>점선은 통신 층, 실선은 물리 층. PLC2만 다른 장치(PLC1)의 서버에서 값을 읽는다. SIS는 다른 PLC와 통신하지 않는다.</figcaption>
+</figure>
+
+<p>예: 주입률 설정값이 17 mg/L이면 PLC2는 2,000 m³/h × 17 ÷ 1000 = 34 kg/h를 상태 표의 <code>P201</code>에 쓴다. 공정은 그 값을 읽어 pH 7.145를 <code>AIT202</code>에 쓰고, SIS가 그 pH를 읽는다.</p>
+
+<h3>프로그램과 Python</h3>
+<div class="table-wrap">
+<table>
+<tr><th>프로그램</th><th>도는 곳 (Mininet)</th><th>Python</th><th>통신 서버</th></tr>
+<tr><td><code>physical_process.py</code></td><td>스위치 <code>s1</code> (기본 네트워크 공간)</td><td>가상환경 3.12</td><td>없음</td></tr>
+<tr><td><code>plc1.py</code></td><td>호스트 <code>plc1</code> 192.168.1.10</td><td>가상환경 3.12</td><td>있음</td></tr>
+<tr><td><code>plc2.py</code></td><td>호스트 <code>plc2</code> 192.168.1.20</td><td>가상환경 3.12</td><td>있음</td></tr>
+<tr><td><code>plc3.py</code></td><td>호스트 <code>plc3</code> 192.168.1.30</td><td>가상환경 3.12</td><td>있음</td></tr>
+<tr><td><code>sis.py</code></td><td>호스트 <code>sis</code> 192.168.1.40</td><td>가상환경 3.12</td><td>있음</td></tr>
+<tr><td><code>hmi.py</code></td><td>호스트 <code>hmi</code> 192.168.1.50</td><td>가상환경 3.12</td><td>없음 (읽고 쓰기만)</td></tr>
+<tr><td><code>run.py</code>, <code>init.py</code></td><td>Mininet 밖</td><td>시스템 3.14, <code>sudo</code></td><td>-</td></tr>
+</table>
+</div>
+<p>Python을 둘로 나눈 이유: <code>run.py</code>는 시스템에 설치된 Mininet을 쓰고, 장치는 가상환경의 MiniCPS와 cpppo를 쓴다. 그래서 <code>config.py</code>와 <code>init.py</code>는 <code>minicps</code>를 import하지 않는다. 둘 다에서 불리기 때문이다.</p>
+
+<h2 id="startup">2. 시작 순서 (<code>run.py</code>)</h2>
+
+<div class="table-wrap">
+<table>
+<tr><th>순서</th><th>하는 일</th><th>이유</th></tr>
+<tr><td>0</td><td><code>run.py</code>가 있는 폴더로 이동</td><td>상태 표, <code>logs/</code>, <code>venv/</code>를 상대 경로로 쓴다</td></tr>
+<tr><td>1</td><td>지난 실행의 프로세스 정리 (<code>pkill</code>)</td><td>남은 통신 서버가 포트를 잡고 있으면 새 서버가 못 뜬다</td></tr>
+<tr><td>2</td><td><code>init.create_state()</code>: 상태 표를 새로 만들고 지난 공정 기록·화면 파일을 지움</td><td>옛 화면이 새 실행 화면처럼 보이지 않게</td></tr>
+<tr><td>3</td><td>스위치 하나, 호스트 다섯. <code>OVSBridge</code>, 컨트롤러 없음</td><td>기본 스위치는 컨트롤러 프로그램이 따로 필요하다</td></tr>
+<tr><td>4</td><td>PLC1, PLC3, SIS를 띄우고 셋의 기록에 <code>initial values written</code>이 찍힐 때까지 기다림</td><td>PLC2가 PLC1보다 먼저 돌면 유량을 0으로 읽어 약품을 0으로 명령한다</td></tr>
+<tr><td>5</td><td>PLC2를 띄우고 같은 방법으로 기다림</td><td>위와 같음</td></tr>
+<tr><td>6</td><td>공정을 <code>s1</code>에서, HMI 화면 루프를 <code>hmi</code>에서 띄움</td><td>장치가 준비되기 전에는 공정 시각이 흐르지 않게</td></tr>
+<tr><td>7</td><td>Mininet 명령창. <code>exit</code>하면 1번 정리 뒤 네트워크 종료</td><td>-</td></tr>
+</table>
+</div>
+<p>4~5번은 20초 안에 준비 신호가 안 오거나 <code>ERROR could not write initial values</code>가 찍히면 오류를 내고 7번 정리로 간다. 20초는 처음 값 쓰기의 최대 시도(20번 × 0.5초 + 통신)보다 길게 잡은 값이다.</p>
+
+<h2 id="tags">3. 태그와 값이 오가는 길</h2>
+
+<p>태그는 <code>(이름, 장치 번호)</code> 짝이다. 번호는 그 센서·구동기가 연결된 장치다: 1=PLC1, 2=PLC2, 3=PLC3, 4=SIS, 0=공통. 이름 앞글자는 계장 기호 관례다(L 수위, F 유량, A 수질, P 펌프, XV 차단밸브).</p>
+
+<h3>물리 층 (상태 표)</h3>
+<div class="table-wrap">
+<table>
+<tr><th>태그</th><th>뜻</th><th>처음 값</th><th>쓰는 쪽 → 읽는 쪽</th></tr>
+<tr><td><code>SIM_TIME:0</code></td><td>공정 시각 (초)</td><td>0</td><td>공정 → PLC1, PLC3</td></tr>
+<tr><td><code>AIT101:1</code></td><td>원수 탁도 (NTU)</td><td>6.0</td><td>바깥 → 공정, PLC1</td></tr>
+<tr><td><code>LIT101:1</code></td><td>착수정 수위 (m)</td><td>3.5</td><td>공정 → PLC1</td></tr>
+<tr><td><code>FIT102:1</code></td><td>생산 유량 (m³/h)</td><td>2000.0</td><td>공정 → PLC1</td></tr>
+<tr><td><code>P101:1</code></td><td>취수 펌프 (1 약, 2 강)</td><td>2</td><td>PLC1 → 공정</td></tr>
+<tr><td><code>P201:2</code></td><td>약품 펌프 명령 (kg/h)</td><td>34.0</td><td>PLC2 → 공정</td></tr>
+<tr><td><code>AIT301:3</code></td><td>침전수 탁도 (NTU)</td><td>0.49</td><td>공정 → PLC3</td></tr>
+<tr><td><code>AIT202:4</code></td><td>주입 후 pH</td><td>7.145</td><td>공정 → SIS</td></tr>
+<tr><td><code>XV201:4</code></td><td>약품 차단밸브 (1 열림, 0 닫힘)</td><td>1</td><td>SIS → 공정</td></tr>
+</table>
+</div>
+<p>처음 값은 <code>config.py</code>의 <code>INITIAL_*</code> 상수 하나씩에서 온다. 상태 표, 장치 서버, HMI가 모두 같은 상수로 시작한다. 공정만 아는 "필요 주입률"은 상태 표에 없고 공정 기록 파일에만 남는다. 센서로는 알 수 없는 값이기 때문이다.</p>
+
+<h3>통신 층 (장치 서버)</h3>
+<div class="table-wrap">
+<table>
+<tr><th>서버</th><th>장치가 올리는 값</th><th>밖에서 써 주는 값</th><th>주기당 통신</th></tr>
+<tr><td>PLC1</td><td><code>LIT101</code>, <code>FIT102</code>, <code>AIT101</code>, <code>P101</code>, <code>SIM_TIME:1</code></td><td>없음</td><td>1회 (올리기)</td></tr>
+<tr><td>PLC2</td><td><code>P201</code></td><td><code>DOSE_SETPOINT</code> (HMI)</td><td>3회 (설정값 읽기, PLC1 유량 읽기, 올리기)</td></tr>
+<tr><td>PLC3</td><td><code>AIT301</code>, <code>TURBIDITY_OVER_MINUTES</code>, <code>TURBIDITY_ALARM</code></td><td>없음</td><td>1회</td></tr>
+<tr><td>SIS</td><td><code>AIT202</code>, <code>XV201</code></td><td><code>SIS_RESET_REQUEST</code> (HMI)</td><td>2회 (요청 읽기, 올리기)</td></tr>
+<tr><td>HMI</td><td>-</td><td>-</td><td>화면 한 번에 4회 (장치마다 한 번에 여러 값)</td></tr>
+</table>
+</div>
+<p>통신 한 번은 cpppo 클라이언트 프로세스를 새로 띄우므로 약 0.08초 걸린다. 그래서 주기당 횟수를 이만큼으로 묶었다. 측정한 PLC2 주기는 평균 1.24초(쉬는 1초 포함)다.</p>
+
+<h2 id="files">4. 파일별 설명</h2>
+
+<div class="card">
+<h3><span class="tag tag-tool">공통</span><code>config.py</code></h3>
+<p>상수, 태그, 주소, 상태 표 구조, 그리고 모든 장치가 쓰는 함수 셋.</p>
+<ul>
+  <li><code>to_number(text, previous)</code>: 읽은 글자를 실수로. 못 바꾸거나 <code>nan</code>·<code>inf</code>면 직전 값.</li>
+  <li><code>to_numbers(texts, previous_values)</code>: 여러 값 읽기 결과용. 길이가 물은 개수와 다르면 전부 직전 값.</li>
+  <li><code>write_initial_values(device, address, tags, values, check_tag)</code>: 자기 서버에 처음 값을 쓰고 확인 태그를 읽어 맞을 때까지 되풀이(최대 20번).</li>
+</ul>
+<p>파일 끝의 <code>assert</code> 몇 줄이 import할 때마다 이 함수들과 처음 값을 점검한다. 예: <code>to_number("b'", 2000.0) == 2000.0</code>.</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-tool">공통</span><code>init.py</code></h3>
+<p><code>create_state()</code>: 상태 표 파일, 지난 공정 기록(<code>logs/process.csv</code>), 지난 화면(<code>logs/hmi_screen.txt</code>)을 지우고 표를 처음 값으로 새로 만든다. <code>run.py</code>가 부르고, <code>python3 init.py</code>로 혼자 돌릴 수도 있다.</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-physical">물리</span><code>physical_process.py</code></h3>
+<p><code>WaterProcess(Tank)</code>. 수식 함수 셋(<code>required_dose</code>, <code>dosed_ph</code>, <code>settled_turbidity</code>)과 한 걸음 계산 <code>step()</code>.</p>
+<pre><code>def step(self):
+    # 0. 읽기: AIT101, P101, P201, XV201
+    # 1. 수위: 취수 유량(2,400 또는 1,600) − 2,000 만큼 오르내림, 0~5 m로 자름
+    # 2. 약품과 pH: 차단밸브가 닫히면 0, 아니면 P201 을 0~250 kg/h 로 자름
+    # 3. 필요 주입률 = 9.8 + 3.0 × ln(원수 탁도)
+    # 4. 침전수 탁도: (실제 − 필요) 를 600칸 줄 뒤에 넣고 맨 앞(5시간 전)을 꺼내 계산
+    # 5. 공정 시각 += 30, 상태 표에 쓰고 기록 파일에 한 줄</code></pre>
+<p><code>pre_loop</code>가 시작할 때 수식을 설계 문서 4-3절 표의 값으로 <code>assert</code> 점검한다. 줄은 처음에 기본값 기준 차이(+1.82)로 600칸을 채워 둔다. 안 채우면 처음 5시간 동안 나오는 물이 없어 잘못된 주입이 가려진다.</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-control">제어</span><code>plc1.py</code> 착수정 수위</h3>
+<pre><code>if self.level &lt;= LEVEL_LOW:      # 3.3 m
+    self.intake_pump = 2          # 강
+elif self.level &gt;= LEVEL_HIGH:   # 3.7 m
+    self.intake_pump = 1          # 약
+self.set(P101, self.intake_pump)</code></pre>
+<p>그 사이 수위에서는 직전 상태를 유지한다(SWaT 예제와 같은 방식). 수위는 3.28~3.72 m 사이를 공정 약 24분 주기로 오르내린다. 물리 층의 <code>SIM_TIME:0</code>을 읽어 자기 서버의 <code>SIM_TIME:1</code>로 올린다. 이름은 같고 번호가 다르다.</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-control">제어</span><code>plc2.py</code> 약품 주입</h3>
+<pre><code>self.dose_setpoint = to_number(self.receive(DOSE_SETPOINT, OWN_ADDRESS), self.dose_setpoint)
+self.production_flow = to_number(self.receive(FIT102, PLC1_ADDRESS), self.production_flow)
+chemical_pump_command = round(self.production_flow * self.dose_setpoint / 1000, 4)
+self.set(P201, chemical_pump_command)</code></pre>
+<p>받은 설정값을 검사하지 않는다. 도메인 문서 2-1절의 "PLC는 값이 적절한지 따지지 않는다"를 그대로 옮긴 것이다. 5~50 mg/L 한계는 다음 단계에서 이 파일에 넣는다(8절).</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-control">제어</span><code>plc3.py</code> 침전수 탁도 경보</h3>
+<p>한 주기 판정은 <code>cycle()</code>에 있다. 시간은 주기 횟수가 아니라 <code>SIM_TIME</code>의 차이로 센다.</p>
+<pre><code>if self.settled_turbidity &gt; TURBIDITY_LIMIT:      # 1.0 NTU
+    self.over_minutes += elapsed_minutes
+else:
+    self.over_minutes = 0.0
+alarm = 1 if self.over_minutes &gt;= TURBIDITY_ALARM_MINUTES else 0   # 30분</code></pre>
+<p>예: 공정 30초마다 2.0 NTU를 읽으면 59번째에 29.5분(경보 없음), 60번째에 30분(경보). 정확히 1.0이 오면 0으로 돌아간다.</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-control">제어</span><code>sis.py</code> pH 차단</h3>
+<p>한 주기 판정은 <code>cycle()</code>에 있다. 다른 PLC의 서버는 읽지 않는다.</p>
+<pre><code>in_range = PH_LOW &lt;= self.ph &lt;= PH_HIGH                 # 5.8~8.5 (경계 포함)
+self.out_of_range_count = 0 if in_range else self.out_of_range_count + 1
+if self.out_of_range_count &gt;= SIS_TRIP_COUNT and self.valve == 1:   # 2번 연속
+    self.valve = 0
+...
+if request == 1 and self.valve == 0 and in_range:      # 복귀는 pH 가 범위 안일 때만
+    self.valve = 1
+self.set(XV201, self.valve)                             # 매 주기 쓴다</code></pre>
+<ul>
+  <li>pH가 <code>[5.75, 7.0, 5.75]</code>로 오면 닫히지 않는다(중간에 횟수가 0이 됨). <code>[5.75, 5.75]</code>면 두 번째에 닫힌다.</li>
+  <li>복귀 요청은 받아들였든 아니든 서버에서 0으로 지운다. 범위 밖일 때 넣은 요청이 남아 있다가 pH가 돌아오는 순간 저절로 열리는 일을 막는다.</li>
+  <li>밸브를 바뀔 때만이 아니라 매 주기 쓰는 이유: 쓰기 한 번이 실패하면 SIS는 "닫힘"인데 상태 표는 "열림"인 채로 남기 때문이다.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-control">창구</span><code>hmi.py</code></h3>
+<p>인자 없이 실행하면 화면 루프: 네 서버에서 읽고(<code>to_numbers</code>), 글자 화면을 <code>logs/hmi_screen.txt.tmp</code>에 쓴 뒤 <code>os.replace</code>로 바꿔 끼운다. 읽는 쪽이 반쯤 쓰인 파일을 보지 않게 하려는 것이다.</p>
+<div class="table-wrap">
+<table>
+<tr><th>명령</th><th>하는 일</th></tr>
+<tr><td><code>hmi.py dose 20</code></td><td>PLC2의 <code>DOSE_SETPOINT</code>에 20.0을 쓴다. 숫자가 아니거나 <code>nan</code>·<code>inf</code>면 보내지 않고 사용법만 찍는다</td></tr>
+<tr><td><code>hmi.py sis reset</code></td><td>SIS의 <code>SIS_RESET_REQUEST</code>에 1을 쓴다</td></tr>
+</table>
+</div>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-tool">실행</span><code>run.py</code></h3>
+<p>함수 넷으로 나뉜다: <code>build_network()</code>, <code>start_devices(network)</code>, <code>wait_until_ready(names)</code>, <code>stop(network)</code>. <code>main()</code>이 이 순서로 부르고 사이에 Mininet 명령창을 연다. 전체 검증(<code>tests/verify_system.py</code>)이 같은 함수를 다시 쓴다.</p>
+</div>
+
+<h2 id="process">5. 공정 수식</h2>
+
+<div class="table-wrap">
+<table>
+<tr><th>수식</th><th>예시</th></tr>
+<tr><td>필요 주입률 = 9.8 + 3.0 × ln(원수 탁도)</td><td>6 NTU → 15.18, 300 NTU → 26.91 mg/L</td></tr>
+<tr><td>실제 주입률 = 약품 유량 × 1000 ÷ 2,000</td><td>34 kg/h → 17 mg/L</td></tr>
+<tr><td>주입 후 pH = 7.4 − 0.015 × 실제 주입률</td><td>17 → 7.145, 110 → 5.75 (SIS 작동)</td></tr>
+<tr><td>침전수 탁도 = 0.4 + 0.15 × 모자란 양² 또는 0.4 + 0.05 × 넘친 양 (5시간 전 값)</td><td>2 모자람 → 1.0, 2 넘침 → 0.5, 9.9 모자람 → 15.1 NTU</td></tr>
+</table>
+</div>
+<p class="meta">도메인 문서의 수치(평상시 필요량 15.38 mg/L, 침전 지연 4~7시간)에 가깝게 잡은 합성 모델이다. 실제 정수장 자료로 맞춘 것이 아니다.</p>
+
+<h2 id="failure">6. 실패를 다루는 규칙</h2>
+
+<p>MiniCPS와 cpppo는 실패해도 예외를 내지 않고 엉뚱한 값을 돌려준다. 2026-11-18에 직접 확인한 모습과 코드의 처리:</p>
+<div class="table-wrap">
+<table>
+<tr><th>상황</th><th>돌아오는 값</th><th>처리</th></tr>
+<tr><td>상대 서버가 꺼진 채 <code>receive</code></td><td><code>"b'"</code> (0.06초)</td><td><code>to_number</code> → 직전 값</td></tr>
+<tr><td>상대 서버가 꺼진 채 <code>receive_multiple</code></td><td><code>[]</code></td><td><code>to_numbers</code> → 전부 직전 값</td></tr>
+<tr><td>없는 태그가 섞인 <code>receive_multiple</code></td><td>앞의 것만 (3개를 물었는데 1개)</td><td><code>to_numbers</code> → 전부 직전 값 (칸이 어긋나지 않게)</td></tr>
+<tr><td>SQLite 오류 중 <code>get</code></td><td><code>None</code></td><td><code>to_number</code> → 직전 값</td></tr>
+<tr><td>서버가 뜨기 전에 <code>send</code></td><td>값이 사라짐 (오류 없음)</td><td><code>write_initial_values</code>가 다시 읽어 확인하고 되풀이</td></tr>
+<tr><td><code>1e-05</code>처럼 소수점 없이 찍히는 실수 보내기</td><td>클라이언트가 정수로 읽다 실패, 값이 안 바뀜</td><td>보내기 전 <code>round(값, 4)</code>, HMI는 <code>nan</code>·<code>inf</code> 거절</td></tr>
+</table>
+</div>
+<p class="note"><strong>기록에 남는 오류 한 줄은 정상이다.</strong> 장치마다 첫 쓰기 때 서버가 아직 안 떠서 <code>ConnectionRefusedError</code>가 한 번 찍히고, 바로 뒤에 <code>initial values written to ...</code>가 찍힌다.</p>
+
+<h2 id="tests">7. 시험</h2>
+
+<div class="table-wrap">
+<table>
+<tr><th>파일</th><th>보는 것</th><th>시간</th><th>2026-11-19 결과</th></tr>
+<tr><td><code>tests/verify_physical_process.py</code></td><td>실제 <code>step()</code>을 1,500걸음 돌리며 걸음 사이에 상태 표를 바꿈. 따로 짠 계산과 값 7,500개 비교, 깨진 입력(<code>'abc'</code>, 빈칸, <code>nan</code>, 음수)</td><td>몇 초</td><td>통과</td></tr>
+<tr><td><code>tests/verify_control_logic.py</code></td><td>SIS·PLC3의 <code>cycle()</code>에 통신 없이 센서값을 순서대로 넣음. 2번 연속, 경계 5.8·8.5, 29.5분/30분, 요청 지우기</td><td>1초</td><td>22개 통과</td></tr>
+<tr><td><code>tests/verify_system.py</code></td><td>Mininet에 전체를 띄우고 확인 1~6 자동 실행 (<code>sudo</code>)</td><td>약 9분</td><td>14개 통과</td></tr>
+</table>
+</div>
+<p>제어 시험이 실제로 잘못을 잡는지도 봤다. 규칙을 일부러 틀리게 바꾼 6가지(SIS가 1번·3번 만에 닫음, pH 5.8을 밖으로 봄, 경보 29분·31분, 정확히 1.0도 초과로 셈)를 모두 잡아냈다.</p>
+
+<h3>실행 명령</h3>
+<pre><code>cd ~/water_cps
+venv/bin/python tests/verify_physical_process.py
+venv/bin/python tests/verify_control_logic.py
+sudo python3 tests/verify_system.py</code></pre>
+
+<h2 id="next">8. 다음 단계에서 고칠 곳</h2>
+
+<div class="table-wrap">
+<table>
+<tr><th>할 일</th><th>고칠 파일</th><th>지금 상태</th></tr>
+<tr><td>주입률 마지막 한계 5~50 mg/L, 1분 2 mg/L (도메인 문서 4-2절)</td><td><code>plc2.py</code>, 시험은 <code>verify_control_logic.py</code>에 PLC2 추가</td><td>설정값을 그대로 따른다. 과주입은 SIS가 막는다</td></tr>
+<tr><td>모델 예측값을 받는 자리와 모드 전환 (도메인 문서 4-4절)</td><td><code>plc2.py</code>, <code>config.py</code>(서버 태그 추가)</td><td>없음</td></tr>
+<tr><td>장치가 죽으면 알리기</td><td>감시 층 (HMI 쪽)</td><td>알리지 않는다</td></tr>
+<tr><td>장치가 죽으면 펌프 정지 흉내</td><td><code>physical_process.py</code></td><td>마지막 명령이 남는다</td></tr>
+<tr><td>구역·방화벽, 출발지 주소 제한</td><td><code>run.py</code>의 토폴로지</td><td>스위치 하나</td></tr>
+</table>
+</div>
+<p class="meta">자세한 근거는 설계 문서 11-2절.</p>
+
+</main>
+</body>
+</html>

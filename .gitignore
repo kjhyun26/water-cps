@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# 실행하면 생기는 것 (run.py, init.py)
+logs/
+*.sqlite
+*.tmp
+
+# 발표 자료는 저장소에 넣지 않는다
+*.pptx
