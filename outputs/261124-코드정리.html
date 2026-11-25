@@ -84,6 +84,7 @@ svg text { font-family: inherit; }
   <li><a href="#failure">실패를 다루는 규칙</a></li>
   <li><a href="#tests">시험</a></li>
   <li><a href="#next">다음 단계에서 고칠 곳</a></li>
+  <li><a href="#dataset">모델 학습 데이터 만드는 법</a></li>
 </ol>
 </nav>
 
@@ -364,7 +365,99 @@ sudo python3 tests/verify_system.py</code></pre>
 <tr><td>구역·방화벽, 출발지 주소 제한</td><td><code>run.py</code>의 토폴로지</td><td>스위치 하나</td></tr>
 </table>
 </div>
-<p class="meta">자세한 근거는 설계 문서 11-2절.</p>
+<p class="meta">자세한 근거는 설계 문서 11-2절. 학습 데이터 만드는 법은 9절에 적었다.</p>
+
+<h2 id="dataset">9. 모델 학습 데이터 만드는 법</h2>
+
+<p class="note"><strong>설계안이다.</strong> 지금 코드 위에 어떻게 붙이면 되는지 적은 계획이고, 아직 구현하거나 시험하지 않았다. 함수 이름과 파일 이름은 제안이다.</p>
+
+<h3>9-1. 무엇을 만드나</h3>
+<p>도메인 문서 4-5절의 모델은 "지금 들어오는 원수를 보고 주입률을 정한다". 학습 데이터 한 줄은 <strong>그 시각의 원수 센서값과 그때 넣은 주입률</strong>, 그리고 <strong>5시간 뒤의 침전수 탁도</strong>를 묶은 것이다. 주입은 지금 하고 결과는 5시간 뒤에 나오므로, 두 시각의 기록을 한 줄로 이어 붙여야 한다(도메인 문서 4-5절).</p>
+
+<div class="table-wrap">
+<table>
+<tr><th>열</th><th>어디서</th><th>용도</th></tr>
+<tr><td><code>sim_time_seconds</code></td><td><code>logs/process.csv</code>의 t 줄</td><td>시간순 분할용</td></tr>
+<tr><td><code>raw_turbidity_ntu</code></td><td>t 줄</td><td>입력 (센서)</td></tr>
+<tr><td><code>actual_dose_mg_per_liter</code></td><td>t 줄</td><td>운영자를 따라 배우는 정답</td></tr>
+<tr><td><code>settled_turbidity_after_5h_ntu</code></td><td>t + 600걸음 줄의 <code>settled_turbidity_ntu</code></td><td>과주입을 얼마나 줄여도 되는지 배우는 결과값</td></tr>
+<tr><td><code>required_dose_mg_per_liter</code></td><td>t 줄</td><td><strong>평가 전용.</strong> 센서로 알 수 없는 정답이라 입력으로 쓰면 안 된다</td></tr>
+</table>
+</div>
+<p>예: 공정 시각 7,200초에 원수 탁도 6 NTU, 주입률 17 mg/L였다면, 그 줄의 결과값은 25,200초(7,200 + 18,000) 줄의 침전수 탁도 0.4912 NTU다.</p>
+
+<h3>9-2. 두 가지 만드는 길</h3>
+<div class="table-wrap">
+<table>
+<tr><th></th><th>가. 공정만 빨리 돌리기 (권장)</th><th>나. Mininet 전체로 돌리기</th></tr>
+<tr><td>방법</td><td><code>tests/verify_physical_process.py</code>처럼 <code>WaterProcess.step()</code>을 기다림 없이 부르고, 걸음 사이에 원수 탁도와 약품 펌프 명령을 상태 표에 쓴다</td><td><code>run.py</code>로 띄워 두고 바깥 스크립트가 <code>AIT101</code>을 고치고 <code>hmi.py dose</code>를 보낸다</td></tr>
+<tr><td>30일치 시간</td><td>몇 초 (86,400걸음)</td><td>실제 약 12시간 (60배)</td></tr>
+<tr><td>PLC 동작</td><td>PLC2 계산(유량 × 주입률 ÷ 1000)을 스크립트가 대신한다. 이 계층의 PLC2는 이 한 줄이 전부라 결과가 같다</td><td>실제 PLC 주기, 통신 지연, SIS가 모두 들어간다</td></tr>
+<tr><td>쓸 때</td><td>학습용 대량 데이터</td><td>짧은 확인용, 발표 시연</td></tr>
+</table>
+</div>
+
+<h3>9-3. 붙일 것 세 가지</h3>
+<div class="card">
+<h3><span class="tag tag-tool">새 파일</span><code>water_cps/scenarios.py</code>: 원수 시나리오</h3>
+<p>공정 시각을 받아 원수 탁도를 돌려주는 함수. 이 계층은 원수를 정하지 않으므로(1-3절) 바깥에 둔다.</p>
+<pre><code>def raw_turbidity(sim_time_seconds, storms):
+    """평상시 6 NTU ± 1 에, storms 목록의 호우를 얹는다. 호우 하나는 (시작 초, 정점 NTU)."""
+    hours = sim_time_seconds / 3600
+    value = 6.0 + math.sin(hours / 24 * 2 * math.pi)          # 하루 주기로 천천히 흔들림
+    for start, peak in storms:
+        since = (sim_time_seconds - start) / 3600
+        if 0 &lt;= since &lt; 3:                                      # 3시간에 걸쳐 오름 (로그 눈금 직선)
+            value = max(value, 6.0 * (peak / 6.0) ** (since / 3))
+        elif 3 &lt;= since &lt; 15:                                   # 12시간에 걸쳐 내림
+            value = max(value, peak * (6.0 / peak) ** ((since - 3) / 12))
+    return value</code></pre>
+<p>도메인 문서 4-6절처럼 "30일 동안 호우 3번"을 만들려면 <code>storms=[(5*86400, 300), (14*86400, 150), (23*86400, 400)]</code>처럼 준다. 조류(탁도는 그대로인데 필요 주입률만 오르는 경우)를 넣으려면 공정의 <code>required_dose()</code>에 "숨은 조류 영향" 값을 더하는 입력이 하나 더 필요하다(공정 쪽 변경).</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-tool">새 파일</span><code>water_cps/operator_policy.py</code>: 운영자 흉내</h3>
+<p>학습 기록의 주입률은 운영자가 넣은 값이다(도메인 문서 2-5절). 운영자처럼 정하는 규칙이 있어야 "운영자를 따라 배운 값"이 생긴다.</p>
+<pre><code>class OperatorPolicy:
+    """하루 한 번 자-테스트로 필요량을 재고, 2 mg/L 넉넉히 넣는다. 그 사이에는 값을 그대로 둔다."""
+    def __init__(self, overdose=2.0, jar_test_hours=(9,)):
+        self.overdose, self.jar_test_hours, self.setpoint = overdose, jar_test_hours, 17.0
+    def setpoint_at(self, sim_time_seconds, true_required_dose):
+        hour = int(sim_time_seconds // 3600) % 24
+        if hour in self.jar_test_hours and sim_time_seconds % 3600 == 0:
+            self.setpoint = true_required_dose + self.overdose   # 자-테스트 = 실제 필요량을 재는 실험
+        return self.setpoint</code></pre>
+<p>자-테스트를 흉내 낼 때만 공정의 <code>required_dose()</code>(정답)를 쓴다. 실제로도 자-테스트는 물을 직접 실험해 필요량을 알아내는 일이기 때문이다. 호우가 오면 다음 자-테스트까지 운영자 값이 모자라므로, 도메인 문서 2-4절의 "한두 시간 비는" 상황이 그대로 나온다.</p>
+</div>
+
+<div class="card">
+<h3><span class="tag tag-tool">새 파일</span><code>water_cps/dataset/build_dataset.py</code>: 돌리고 묶기</h3>
+<pre><code>for step_number in range(30 * 86400 // 30):                  # 30일
+    now = step_number * 30
+    raw = raw_turbidity(now, storms)
+    put('AIT101', 1, raw)                                    # 바깥 값: 원수
+    dose = operator.setpoint_at(now, required_dose(raw))      # 운영자가 정한 주입률
+    put('P201', 2, 2000.0 * dose / 1000)                     # PLC2 가 할 계산
+    process.step()
+# 기록 파일을 읽어 t 줄과 t+600 줄을 이어 붙여 dataset.csv 로 쓴다 (마지막 600줄은 결과가 없어 버린다)</code></pre>
+<ul>
+  <li><strong>나누기</strong>: 시간순으로 나눈다(예: 앞 21일 학습, 뒤 9일 시험). 무작위로 섞으면 5시간짜리 줄들이 겹쳐 학습과 시험에 같은 물이 들어간다.</li>
+  <li><strong>시험에 호우를 남긴다</strong>: 시험 기간에 호우가 하나는 있어야 "처음 보는 물"을 평가할 수 있다.</li>
+  <li><strong>평가</strong>: 모델이 낸 주입률을 <code>required_dose</code>와 비교하고, 그 주입률로 공정을 다시 돌려 5시간 뒤 침전수 탁도가 1.0 NTU를 넘은 시간을 잰다(도메인 문서 4-6절의 "탁도 초과 시간").</li>
+</ul>
+</div>
+
+<h3>9-4. 센서를 늘리려면</h3>
+<p>도메인 문서 3-3절의 모델은 탁도, pH, 수온, 전기전도도 네 값을 본다. 지금 공정은 탁도만 쓴다. 늘리려면 아래를 함께 고친다.</p>
+<div class="table-wrap">
+<table>
+<tr><th>고칠 곳</th><th>할 일</th></tr>
+<tr><td><code>config.py</code></td><td>물리 층 태그 <code>AIT102</code>(원수 pH), <code>TIT101</code>(수온), <code>AIT103</code>(전도도)와 처음 값, PLC1 서버 태그 추가</td></tr>
+<tr><td><code>physical_process.py</code></td><td>세 값을 읽고 <code>required_dose()</code>와 <code>dosed_ph()</code>에 반영 (예: 수온이 낮으면 필요량 증가, 전도도가 낮으면 pH가 더 떨어짐). 기록 파일에 열 추가</td></tr>
+<tr><td><code>plc1.py</code>, <code>hmi.py</code></td><td>새 센서값을 서버에 올리고 화면에 표시</td></tr>
+<tr><td><code>tests/verify_physical_process.py</code></td><td>독립 계산과 기대값 표를 새 수식에 맞게 고침</td></tr>
+</table>
+</div>
 
 </main>
 </body>
