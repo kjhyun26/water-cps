@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# 실행하면 생기는 것 (run.py, init.py)
+logs/
+*.sqlite
+*.tmp
+
+# 발표 자료는 저장소에 넣지 않는다
+*.pptx
+
+# 생성된 학습 데이터 (build_dataset.py 로 재생성 가능)
+water_cps/dataset/*.csv
+
+# 학습된 모델 (train_model.py 로 재생성 가능)
+water_cps/dataset/models/*.pkl
+water_cps/dataset/models/metrics.json
