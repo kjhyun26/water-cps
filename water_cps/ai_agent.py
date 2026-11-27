@@ -1,201 +1,196 @@
-"""AI 에이전트: 원수 탁도를 읽고 AI 모델로 주입률 설정값을 PLC2에 전달한다.
+"""AI 에이전트: 원수 탁도를 읽고 AI 모델로 주입률 설정값을 정해 PLC2에 전달한다.
 
-HMI와 같은 통신 구조를 사용한다 (설계 문서 5-2절, 6절).
-모델은 dataset/train_model.py 로 사전 학습된 pkl 파일을 불러온다.
+HMI와 같은 통신 구조를 쓴다 (설계 문서 5-2절, 6절). hmi 노드에서 hmi.py 와 함께 돈다.
+모델은 dataset/train_model.py 로 미리 학습한 pkl 파일을 불러온다 (ai_model.py).
 
 실행:
-    python ai_agent.py          AI 자동 제어 루프
-    python ai_agent.py status   현재 AI 예측값 한 번만 출력
+    python ai_agent.py          자동 제어 루프
+    python ai_agent.py status   지금 탁도로 예측값을 한 번만 출력
+    python ai_agent.py pause    자동 제어 멈춤 (운영자가 hmi.py dose 로 직접 넣을 때)
+    python ai_agent.py resume   자동 제어 다시 시작
 
-보안 조치 (보안 설계 문서 F1·H2):
-    F1 — 출력 범위 검사: 예측값이 허용 범위를 벗어나면 안전 기본값 사용
-    H2 — 입력 이상 탐지: 탁도가 급격히 변하면 경보 출력 (센서 위변조 의심)
+설정값 = 예측한 필요 주입률 + 여유(ai_model.SAFETY_MARGIN)
+조류 보정값은 logs/algae_sensor.txt 에서 읽는다 (scenario_feeder.py 가 쓰는 조류 센서 흉내).
+파일이 없으면 0으로 본다.
+
+보안 조치:
+    출력 범위 검사 — 설정값이 5~50 mg/L를 벗어나면 범위 끝값으로 자른다.
+                    유형 모델이 없으면 직전 설정값을 유지한다.
+    입력 이상 탐지 — 탁도가 한 번에 100 NTU 넘게 바뀌거나 1000 NTU를 넘으면 경보를 내고
+                    그 값으로 설정값을 바꾸지 않는다(직전 설정값 유지). 새 값이 5번 연속
+                    비슷하게 읽히면(공정 약 5분) 실제 변화로 보고 받아들인다.
 """
 
-import math
 import os
-import pickle
 import sys
 import time
 
 from minicps.devices import HMI
 
+import ai_model
 from config import (
     ADDRESS, AIT101, CLIENT_PROTOCOL, DEVICE_SLEEP_SECONDS, DOSE_SETPOINT,
-    INITIAL_DOSE_SETPOINT, INITIAL_RAW_TURBIDITY, STATE, SIM_TIME_PLC1, to_number,
+    INITIAL_DOSE_SETPOINT, INITIAL_RAW_TURBIDITY, SIM_TIME_PLC1, STATE, to_number,
 )
-
-# ---------------------------------------------------------------------------
-# 경로 설정
-# ---------------------------------------------------------------------------
-WATER_CPS_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(WATER_CPS_DIR, 'dataset', 'models')
 
 PLC1_ADDRESS = ADDRESS['plc1']
 PLC2_ADDRESS = ADDRESS['plc2']
 
-# ---------------------------------------------------------------------------
-# 보안 F1: 출력 범위 허용값 (mg/L)
-# ---------------------------------------------------------------------------
+PAUSE_FILE = 'logs/ai_agent.pause'
+ALGAE_SENSOR_FILE = 'logs/algae_sensor.txt'
+USAGE = 'usage: python ai_agent.py [status | pause | resume]'
+
+# 출력 범위 (mg/L)
 DOSE_MIN = 5.0
 DOSE_MAX = 50.0
-DOSE_SAFE_DEFAULT = INITIAL_DOSE_SETPOINT  # 모델 오류 시 사용할 안전 기본값
 
-# ---------------------------------------------------------------------------
-# 보안 H2: 입력 이상 탐지 임계값
-# ---------------------------------------------------------------------------
-TURBIDITY_SPIKE_THRESHOLD = 100.0   # 한 걸음에 이만큼 오르면 경보
-TURBIDITY_MAX_VALID = 1000.0        # 이 값 초과면 센서 고장으로 판단
+# 입력 이상 탐지
+TURBIDITY_SPIKE_THRESHOLD = 100.0   # 한 번에 이만큼 넘게 바뀌면 의심 (NTU)
+TURBIDITY_MAX_VALID = 1000.0        # 이 값을 넘으면 센서 고장이나 위변조로 본다 (NTU)
+SPIKE_CONFIRM_CYCLES = 5            # 의심 값이 이만큼 연속 비슷하게 읽히면 받아들인다
 
-
-# ---------------------------------------------------------------------------
-# 모델 로드
-# ---------------------------------------------------------------------------
-def load_models(model_dir: str = MODEL_DIR):
-    """scaler, classifier, 유형별 regressor를 모두 불러온다."""
-    def load(name):
-        path = os.path.join(model_dir, name)
-        with open(path, 'rb') as f:
-            return pickle.load(f)
-
-    scaler = load('scaler.pkl')
-    clf = load('classifier.pkl')
-
-    # 유형 목록은 분류기의 classes_ 에서 읽는다
-    regressors = {}
-    for label in clf.classes_:
-        pkl_path = os.path.join(model_dir, f'model_{label}.pkl')
-        if os.path.exists(pkl_path):
-            regressors[label] = load(f'model_{label}.pkl')
-
-    print(f"[AI] 모델 로드 완료: {list(regressors.keys())}")
-    return scaler, clf, regressors
+LOG_EVERY_CYCLES = 10
 
 
-# ---------------------------------------------------------------------------
-# 추론 (보안 조치 포함)
-# ---------------------------------------------------------------------------
-def predict_dose(raw_turbidity_ntu: float, algae_extra: float,
-                 scaler, clf, regressors) -> tuple[float, str, str]:
-    """주입률 설정값을 예측한다.
-
-    Returns:
-        (dose_mg_per_l, water_type, security_flag)
-        security_flag: '' 정상 | 'F1_CLIPPED' 범위 초과 클리핑 | 'F1_FALLBACK' 모델 없음
-    """
-    ntu = raw_turbidity_ntu
-    x = scaler.transform([[ntu, math.log(max(ntu, 0.1)), algae_extra]])
-
-    water_type = clf.predict(x)[0]
-
-    if water_type not in regressors:
-        # F1: 해당 유형 모델 없음 → 안전 기본값
-        return DOSE_SAFE_DEFAULT, water_type, 'F1_FALLBACK'
-
-    dose = regressors[water_type].predict(x)[0]
-
-    # F1: 출력 범위 검사
-    flag = ''
-    if dose < DOSE_MIN or dose > DOSE_MAX:
-        dose_clipped = max(DOSE_MIN, min(DOSE_MAX, dose))
-        print(f'[AI][F1] 범위 초과 클리핑: {dose:.2f} → {dose_clipped:.2f} mg/L')
-        dose = dose_clipped
-        flag = 'F1_CLIPPED'
-
-    return round(dose, 4), water_type, flag
+def read_algae():
+    try:
+        with open(ALGAE_SENSOR_FILE) as f:
+            return max(0.0, to_number(f.read().strip(), 0.0))
+    except FileNotFoundError:
+        return 0.0
 
 
-# ---------------------------------------------------------------------------
-# AI 에이전트
-# ---------------------------------------------------------------------------
+def decide_setpoint(turbidity, algae, models, previous_setpoint):
+    """(설정값, 유형, 플래그 목록). 모델 출력에 출력 범위 검사를 붙인다."""
+    required, water_type = ai_model.predict_required(turbidity, algae, *models)
+    if required is None:
+        return previous_setpoint, water_type, ['NO_MODEL_HOLD']
+    setpoint = required + ai_model.SAFETY_MARGIN
+    if not DOSE_MIN <= setpoint <= DOSE_MAX:
+        clipped = min(max(setpoint, DOSE_MIN), DOSE_MAX)
+        print('[AI][범위] 설정값 %.2f → %.2f mg/L 로 자름' % (setpoint, clipped))
+        return round(clipped, 4), water_type, ['CLIPPED']
+    return round(setpoint, 4), water_type, []
+
+
+class TurbidityGuard:
+    """입력 이상 탐지. accept(값) → (믿을 탁도, 경보 여부)."""
+
+    def __init__(self, initial):
+        self.trusted = initial
+        self.suspect = None
+        self.streak = 0
+
+    def accept(self, reading):
+        if reading > TURBIDITY_MAX_VALID or reading < 0:
+            print('[AI][이상] 탁도 %.1f NTU 는 허용 범위(0~%.0f) 밖. 무시하고 %.1f NTU 로 계속'
+                  % (reading, TURBIDITY_MAX_VALID, self.trusted))
+            self.suspect, self.streak = None, 0
+            return self.trusted, True
+        if abs(reading - self.trusted) <= TURBIDITY_SPIKE_THRESHOLD:
+            self.trusted = reading
+            self.suspect, self.streak = None, 0
+            return reading, False
+        if self.suspect is not None and abs(reading - self.suspect) <= TURBIDITY_SPIKE_THRESHOLD:
+            self.streak += 1
+        else:
+            self.streak = 1
+        self.suspect = reading
+        if self.streak >= SPIKE_CONFIRM_CYCLES:
+            print('[AI][이상] 탁도 %.1f NTU 가 %d번 연속 읽혀 실제 변화로 받아들임'
+                  % (reading, self.streak))
+            self.trusted = reading
+            self.suspect, self.streak = None, 0
+            return reading, True
+        print('[AI][이상] 탁도 급변 %.1f → %.1f NTU (%d/%d). 직전 설정값 유지'
+              % (self.trusted, reading, self.streak, SPIKE_CONFIRM_CYCLES))
+        return self.trusted, True
+
+
 class AiAgent(HMI):
 
-    def pre_loop(self):
-        self.scaler, self.clf, self.regressors = load_models()
-        self.prev_turbidity = INITIAL_RAW_TURBIDITY
-        self.current_dose = DOSE_SAFE_DEFAULT
+    def setup(self):
+        self.models = ai_model.load_models()
+        print('[AI] 모델 로드 완료: %s' % ', '.join(sorted(self.models[2])))
+        self.guard = TurbidityGuard(INITIAL_RAW_TURBIDITY)
+        self.setpoint = INITIAL_DOSE_SETPOINT
         self.cycle_count = 0
+        self.paused = False
 
     def main_loop(self):
+        # MiniCPS의 HMI 클래스는 PLC와 달리 pre_loop()을 부르지 않는다. 여기서 준비한다.
         arguments = sys.argv[1:]
+        if arguments == ['pause']:
+            open(PAUSE_FILE, 'w').close()
+            print('AI 자동 제어 멈춤. 다시 시작: python ai_agent.py resume')
+            return
+        if arguments == ['resume']:
+            if os.path.exists(PAUSE_FILE):
+                os.remove(PAUSE_FILE)
+            print('AI 자동 제어 다시 시작')
+            return
+        if arguments not in ([], ['status']):
+            print(USAGE)
+            return
+        self.setup()
         if arguments == ['status']:
-            self._status_once()
+            self.status_once()
         else:
-            self._control_loop()
+            self.control_loop()
 
-    def _read_turbidity(self) -> float:
-        """PLC1에서 원수 탁도를 읽는다. 실패하면 직전 값을 반환한다."""
-        raw = self.receive(AIT101, PLC1_ADDRESS)
-        return to_number(raw, self.prev_turbidity)
+    def read_turbidity(self):
+        return to_number(self.receive(AIT101, PLC1_ADDRESS), self.guard.trusted)
 
-    def _read_sim_time(self) -> float:
-        raw = self.receive(SIM_TIME_PLC1, PLC1_ADDRESS)
-        return to_number(raw, 0.0)
-
-    def _check_h2(self, turbidity: float) -> bool:
-        """H2: 탁도 급변 감지. True이면 이상."""
-        delta = abs(turbidity - self.prev_turbidity)
-        if delta > TURBIDITY_SPIKE_THRESHOLD:
-            print(f'[AI][H2] 탁도 급변 경보: {self.prev_turbidity:.1f} → {turbidity:.1f} NTU '
-                  f'(변화량 {delta:.1f}, 임계값 {TURBIDITY_SPIKE_THRESHOLD})')
-            return True
-        if turbidity > TURBIDITY_MAX_VALID:
-            print(f'[AI][H2] 탁도 센서 오류 의심: {turbidity:.1f} NTU (최대 허용 {TURBIDITY_MAX_VALID})')
-            return True
-        return False
-
-    def _control_loop(self):
+    def control_loop(self):
         print('[AI] 자동 제어 루프 시작')
         while True:
             cycle_start = time.time()
             self.cycle_count += 1
 
-            turbidity = self._read_turbidity()
-            sim_time = self._read_sim_time()
+            paused = os.path.exists(PAUSE_FILE)
+            if paused != self.paused:
+                print('[AI] 자동 제어 %s' % ('멈춤 (운영자 수동)' if paused else '다시 시작'))
+                self.paused = paused
 
-            # H2 이상 탐지 (탁도는 그대로 사용하되 경보만 출력)
-            anomaly = self._check_h2(turbidity)
+            reading = self.read_turbidity()
+            turbidity, anomaly = self.guard.accept(reading)
+            algae = read_algae()
+            flags = ['ANOMALY_HOLD'] if anomaly else []
 
-            # 추론
-            dose, water_type, flag = predict_dose(
-                turbidity, 0.0,  # algae_extra: 현재는 센서 없음 → 0으로 고정
-                self.scaler, self.clf, self.regressors,
-            )
+            if anomaly:
+                water_type = '-'
+            else:
+                self.setpoint, water_type, more = decide_setpoint(
+                    turbidity, algae, self.models, self.setpoint)
+                flags += more
 
-            # PLC2에 전달
-            self.send(DOSE_SETPOINT, dose, PLC2_ADDRESS)
-            self.current_dose = dose
-            self.prev_turbidity = turbidity
+            if not self.paused:
+                self.send(DOSE_SETPOINT, self.setpoint, PLC2_ADDRESS)
 
-            # 로그 (10사이클마다)
-            if self.cycle_count % 10 == 1:
-                flags = []
-                if anomaly:
-                    flags.append('H2')
-                if flag:
-                    flags.append(flag)
-                flag_str = ' [' + ','.join(flags) + ']' if flags else ''
-                day = int(sim_time // 86400) + 1
-                hhmm = int(sim_time % 86400) // 60
-                print(f'[AI] {day}일 {hhmm//60:02d}:{hhmm%60:02d} '
-                      f'탁도={turbidity:.1f} NTU 유형={water_type} '
-                      f'설정={dose:.2f} mg/L{flag_str}')
+            if self.cycle_count % LOG_EVERY_CYCLES == 1 or flags:
+                sim_time = to_number(self.receive(SIM_TIME_PLC1, PLC1_ADDRESS), 0.0)
+                minutes = int(sim_time % 86400) // 60
+                print('[AI] %d일차 %02d:%02d 탁도=%.1f NTU 조류=%.1f 유형=%s 설정=%.2f mg/L%s%s'
+                      % (int(sim_time // 86400) + 1, minutes // 60, minutes % 60, reading, algae,
+                         water_type, self.setpoint,
+                         ' [' + ','.join(flags) + ']' if flags else '',
+                         ' (멈춤: 보내지 않음)' if self.paused else ''))
 
-            elapsed = time.time() - cycle_start
-            sleep_time = max(0.0, DEVICE_SLEEP_SECONDS - elapsed)
-            time.sleep(sleep_time)
+            time.sleep(max(0.0, DEVICE_SLEEP_SECONDS - (time.time() - cycle_start)))
 
-    def _status_once(self):
-        """현재 상태를 한 번 출력하고 종료한다."""
-        turbidity = self._read_turbidity()
-        dose, water_type, flag = predict_dose(
-            turbidity, 0.0, self.scaler, self.clf, self.regressors,
-        )
-        print(f'탁도: {turbidity:.1f} NTU')
-        print(f'유형: {water_type}')
-        print(f'예측 주입률: {dose:.2f} mg/L')
-        if flag:
-            print(f'보안 플래그: {flag}')
+    def status_once(self):
+        reading = self.read_turbidity()
+        algae = read_algae()
+        setpoint, water_type, flags = decide_setpoint(reading, algae, self.models, self.setpoint)
+        print('탁도: %.1f NTU' % reading)
+        print('조류 보정: %.1f mg/L' % algae)
+        print('유형: %s' % water_type)
+        print('AI 설정값: %.2f mg/L' % setpoint)
+        print('PLC2 현재 설정값: %.2f mg/L'
+              % to_number(self.receive(DOSE_SETPOINT, PLC2_ADDRESS), float('nan')))
+        print('자동 제어: %s' % ('멈춤' if os.path.exists(PAUSE_FILE) else '동작'))
+        if flags:
+            print('플래그: %s' % ', '.join(flags))
 
 
 if __name__ == '__main__':

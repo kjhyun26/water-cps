@@ -115,6 +115,9 @@ def raw_conditions(sim_time_seconds: float, scenario: Scenario) -> Tuple[float, 
             contribution = storm.peak_ntu * (scenario.base_turbidity / storm.peak_ntu) ** t
             storm_contribution = max(storm_contribution, contribution)
 
+    # 호우가 실제로 탁도를 정할 때만 호우로 본다. 호우 꼬리에서 탁도가 평상시 수준으로
+    # 돌아온 뒤까지 호우라고 부르면, 탁도만 보는 분류기가 배울 수 없는 레이블이 된다.
+    storm_dominant = storm_contribution > value
     value = max(value, storm_contribution)
 
     # 3. 조류 추가 주입률
@@ -124,20 +127,21 @@ def raw_conditions(sim_time_seconds: float, scenario: Scenario) -> Tuple[float, 
             algae_extra = max(algae_extra, event.extra_dose_mg_per_l)
 
     # 4. 유형 판정
-    label = _classify(value, storm_contribution, algae_extra)
+    label = _classify(value, storm_dominant, algae_extra)
 
     return round(value, 4), round(algae_extra, 4), label
 
 
-def _classify(turbidity: float, storm_contribution: float, algae_extra: float) -> str:
+def _classify(turbidity: float, storm_dominant: bool, algae_extra: float) -> str:
     """탁도와 이벤트 정보로 유형 레이블을 결정한다.
 
     우선순위: 호우 > 조류 > 고탁도 > 평상시
-    호우: storm_contribution이 기여 중 (> 0)
+    호우: 호우 기여분이 평상시 탁도보다 커서 탁도를 정하고 있음
     조류: algae_extra > 0
-    고탁도: 탁도 ≥ 50 NTU (호우 없이)
+    고탁도: 탁도 ≥ 50 NTU (호우 없이). 기본 시나리오에서는 50 NTU를 넘는 때가 모두
+          호우 중이라 나오지 않는다.
     """
-    if storm_contribution > 0:
+    if storm_dominant:
         return TYPE_STORM
     if algae_extra > 0:
         return TYPE_ALGAE

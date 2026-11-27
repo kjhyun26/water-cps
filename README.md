@@ -6,7 +6,7 @@
 - 제어 계층: 센서를 읽고 펌프와 밸브를 움직이는 PLC 세 대와 SIS(PLC와 따로 두는 안전 장치).
 - HMI: 값을 보여 주고 설정값을 넣는 최소한의 화면.
 
-모델 예측, 게이트웨이, 구역·방화벽 같은 "스마트 정수장" 부분은 이 계층 위에 붙을 다음 단계이고, 여기에는 없습니다.
+AI 주입률 예측은 아래 "AI 에이전트" 절에 있습니다. 게이트웨이, 구역·방화벽 같은 나머지 "스마트 정수장" 부분은 다음 단계이고, 여기에는 없습니다.
 
 ## 무엇이 무엇을 하나
 
@@ -39,6 +39,9 @@
    ├─ plc1.py  plc2.py  plc3.py  sis.py   제어 계층
    ├─ hmi.py               화면 갱신과 명령
    ├─ run.py               Mininet 가상 네트워크 구성과 장치 실행
+   ├─ scenarios.py  operator_policy.py  scenario_feeder.py   원수 시나리오와 운영자 흉내
+   ├─ ai_model.py  ai_agent.py                               AI 추론과 에이전트
+   ├─ dataset/             학습 데이터 생성, 학습, 평가 (아래 "AI 에이전트" 절)
    └─ tests/
       ├─ verify_physical_process.py  공정만 1,500걸음 대본 검증
       ├─ verify_control_logic.py     SIS·PLC3 판정에 센서값을 순서대로 넣어 봄
@@ -115,66 +118,102 @@ sudo python3 tests/verify_system.py                  # 전체. 약 9분
 
 ## AI 에이전트 (스마트 정수장)
 
-물리·제어 계층 위에 AI 추론 계층을 붙였습니다. 원수 탁도를 보고 약품 주입률 설정값을 자동으로 예측해 PLC2에 전달합니다.
+물리·제어 계층 위에 AI 추론 계층을 붙였습니다. 원수 탁도를 보고 약품 주입률 설정값을 정해 PLC2에 전달합니다. 운영자는 하루 한 번 자-테스트를 해서 그 사이에는 설정값이 물 상태를 따라가지 못하는데, AI는 공정 1분마다 다시 정합니다.
 
 ### 추가된 파일
 
 | 파일 | 역할 |
 |---|---|
-| `water_cps/scenarios.py` | 원수 조건 생성 (평상시·호우·조류·고탁도) |
-| `water_cps/operator_policy.py` | 운영자 자-테스트 정책 시뮬레이션 |
-| `water_cps/dataset/build_dataset.py` | 학습 데이터 CSV 생성 |
-| `water_cps/dataset/train_model.py` | scikit-learn 2단계 모델 학습 |
-| `water_cps/ai_agent.py` | AI 추론 → PLC2 자동 제어 |
+| `water_cps/scenarios.py` | 원수 시나리오 (평상시·호우·조류). 30일, 호우 3번, 조류 1번 |
+| `water_cps/operator_policy.py` | 운영자 정책 흉내 (하루 1회 자-테스트, 탁도 급등 시 비상 주입) |
+| `water_cps/dataset/build_dataset.py` | 공정 수식을 빠르게 돌려 학습 데이터 CSV 생성 |
+| `water_cps/dataset/train_model.py` | scikit-learn 2단계 모델 학습과 평가 |
+| `water_cps/dataset/evaluate_policy.py` | 운영자와 AI를 같은 30일 시나리오로 돌려 비교 |
+| `water_cps/ai_model.py` | 모델 불러오기와 추론 (학습·평가·에이전트가 같이 씀) |
+| `water_cps/ai_agent.py` | 실행 중인 시스템에서 AI 추론 → PLC2 설정값 전달 |
+| `water_cps/scenario_feeder.py` | 실행 중인 시스템에 원수 시나리오를 흘려 넣음 |
 
-### 모델 구조
+### 모델
 
-1단계: 원수 탁도 → 수질 유형 분류 (RandomForest)  
-2단계: 유형별 주입률 회귀 예측 (normal→Ridge, storm·algae→RandomForest)
+- 1단계: 입력 특성 → 수질 유형 분류 (RandomForest)
+- 2단계: 유형별로 자-테스트 필요 주입률 예측 (평상시 Ridge, 호우·조류 RandomForest)
+- 설정값 = 예측한 필요 주입률 + 여유 2 mg/L (운영자가 자-테스트 값에 여유를 얹는 것과 같음)
 
-입력 특성: 탁도, log(탁도), 조류 보정값  
-학습 데이터: 30일치 시뮬레이션 86,400걸음
+입력 특성은 탁도, log(탁도), 조류 보정값입니다. 학습 목표는 운영자 설정값이 아니라 그 시각에 자-테스트를 했다면 나왔을 값(참 필요 주입률 + 측정 오차 0.5 mg/L)입니다. 하루 한 번만 바뀌는 운영자 설정값을 따라 배우면 모델도 늦게 반응하는 운영자를 흉내 낼 뿐이기 때문입니다. 검증용 20%는 유형 비율을 지켜 무작위로 떼어 둡니다.
 
-### 보안 조치
+### 결과 (2026-11-27)
 
-- **F1 출력 범위 검사**: 예측값이 5~50 mg/L 범위를 벗어나면 클리핑하거나 안전 기본값 사용
-- **H2 입력 이상 탐지**: 한 걸음에 탁도가 100 NTU 이상 급변하면 센서 위변조 경보
+`evaluate_policy.py`, 30일 시나리오:
 
-### 학습 데이터 생성 및 모델 학습
+| 정책 | 침전수 1 NTU 초과 시간 | 최대 침전수 탁도 | PLC3 경보 | 약품 사용량 |
+|---|---|---|---|---|
+| 운영자 (하루 1회 자-테스트) | 0.15% | 5.94 NTU | 1번 | 31.8 t |
+| AI (조류 정보 있음) | 0.00% | 0.53 NTU | 0번 | 25.9 t |
+| AI (조류 정보 없음) | 10.00% | 1.75 NTU | 1번 | 25.2 t |
 
-생성된 CSV와 pkl 파일은 gitignore 처리돼 있습니다. 아래 명령으로 재생성합니다.
+조류는 탁도를 바꾸지 않고 필요 주입률만 올리므로 탁도만 보면 알 수 없습니다. 조류 정보가 없으면 AI는 조류 기간 내내 모자라게 넣습니다. 그래서 에이전트는 조류 센서 값(`logs/algae_sensor.txt`)을 함께 읽습니다.
+
+### 보안 조치 (`ai_agent.py`)
+
+- 출력 범위 검사: 설정값이 5~50 mg/L를 벗어나면 범위 끝값으로 자릅니다. 분류된 유형의 모델이 없으면 직전 설정값을 유지합니다.
+- 입력 이상 탐지: 탁도가 한 번에 100 NTU 넘게 바뀌거나 1000 NTU를 넘으면 경보를 내고 그 값으로 설정값을 바꾸지 않습니다. 새 값이 5번 연속 비슷하게 읽히면(공정 약 5분) 실제 변화로 보고 받아들입니다. 시나리오의 가장 빠른 호우도 공정 1분에 7 NTU 정도 오르므로 정상 호우로는 경보가 나지 않습니다.
+
+### 학습 데이터 생성, 학습, 평가
+
+생성된 CSV와 pkl 파일은 gitignore 처리돼 있습니다. 아래 명령으로 다시 만듭니다.
 
 ```bash
-cd water_cps
-pip install scikit-learn
-python3 dataset/build_dataset.py        # dataset/train.csv 생성 (~1분)
-python3 dataset/train_model.py          # dataset/models/*.pkl 생성
+cd ~/water_cps
+venv/bin/pip install scikit-learn
+venv/bin/python dataset/build_dataset.py       # dataset/train.csv (1초 안쪽)
+venv/bin/python dataset/train_model.py         # dataset/models/*.pkl
+venv/bin/python dataset/evaluate_policy.py     # 운영자와 AI 비교표
 ```
 
-### AI 에이전트 실행
+### 실행
 
-`run.py`의 `USE_AI_AGENT = True`(기본값)로 설정된 상태에서 평소처럼 실행하면 HMI 대신 AI 에이전트가 뜹니다.
+`run.py` 맨 위의 설정으로 무엇을 띄울지 정합니다.
+
+| 설정 | 기본값 | 뜻 |
+|---|---|---|
+| `USE_AI_AGENT` | True | hmi 노드에서 화면(hmi.py)과 함께 AI 에이전트를 띄움 |
+| `FEED_SCENARIO` | True | 원수 공급기를 띄워 호우·조류 시나리오를 흘려 넣음 |
+| `FEED_START_HOURS` | 119.5 | 시나리오 시작 시각. 119.5면 5일차 호우 30분 전이라 실제 30초 뒤 호우가 옴 |
 
 ```bash
+cd ~/water_cps
 sudo python3 run.py
 ```
 
-AI 에이전트 로그는 `logs/ai_agent.log`에 남습니다. 수동으로 개입하고 싶으면 Mininet 명령창에서:
-
-```
-mininet> hmi venv/bin/python hmi.py dose 20
-```
-
-AI 에이전트만 단독으로 테스트하려면:
-
 ```bash
-venv/bin/python ai_agent.py status      # 현재 탁도 읽어서 예측값 한 번 출력
+tail -f ~/water_cps/logs/ai_agent.log            # 다른 터미널: AI 판단
+watch -n 1 cat ~/water_cps/logs/hmi_screen.txt   # 다른 터미널: HMI 화면
 ```
+
+Mininet 명령창에서 넣는 명령:
+
+```
+mininet> hmi venv/bin/python ai_agent.py status    지금 탁도로 AI 예측값 한 번 보기
+mininet> hmi venv/bin/python ai_agent.py pause     AI 자동 제어 멈춤
+mininet> hmi venv/bin/python hmi.py dose 20        (멈춘 뒤) 운영자가 직접 설정
+mininet> hmi venv/bin/python ai_agent.py resume    AI 자동 제어 다시 시작
+```
+
+AI를 멈추지 않고 `hmi.py dose`를 넣으면 1초 안에 AI가 자기 값으로 덮어씁니다.
+
+`tests/verify_system.py`는 AI와 원수 공급기 없이 기존 구성을 시험합니다(`start_devices`의 기본값).
+
+### AI 부분의 한계
+
+- 공정(`physical_process.py`)은 조류를 계산하지 않습니다. 그래서 실행 중인 시스템에서는 조류 기간에 AI가 주입률을 올려도 공정에는 과주입으로만 나타납니다. 조류 효과는 `evaluate_policy.py`에서만 확인할 수 있습니다.
+- 입력 이상 탐지는 한 번에 크게 바뀌는 값만 잡습니다. 100 NTU보다 작게 조금씩 바꾸는 위변조는 잡지 못합니다.
+- 고탁도(high_turbidity) 유형은 기본 시나리오에서 나오지 않아 모델이 없습니다. 50 NTU를 넘는 때가 모두 호우 중이기 때문입니다.
+- 공정 수식이 결정적이라 평상시 모델은 거의 오차 없이 맞힙니다. 실제 정수장 데이터는 이보다 훨씬 흩어져 있을 것입니다.
 
 ## 일부러 남긴 한계
 
 설계 문서 11-2절에 자세히 적었습니다.
 
-- PLC2는 받은 설정값을 검사하지 않습니다. 범위 검사(5~50 mg/L)는 AI 에이전트(`ai_agent.py`) 쪽에서 수행합니다(F1 보안 조치).
+- PLC2는 받은 설정값을 검사하지 않습니다. AI 에이전트(`ai_agent.py`)가 보내는 값은 에이전트 쪽에서 5~50 mg/L로 자르지만, 다른 곳에서 PLC2에 쓰는 값은 여전히 검사하지 않습니다.
 - 장치 프로그램이 죽어도 알리지 않습니다. 알아채는 일은 감시 층의 몫입니다.
 - 통신에 인증이 없습니다(EtherNet/IP와 MiniCPS의 한계). 구역·방화벽 단계에서 출발지 주소로 제한합니다.

@@ -1,174 +1,180 @@
-"""모델 학습: 약품 주입률 예측 회귀 모델을 훈련하고 저장한다.
+"""모델 학습: 약품 주입률 예측 모델을 훈련하고 저장한다.
 
 2단계 구조 (도메인 문서 4-5절):
-  1단계 — 유형 분류: raw_turbidity → water_type (RandomForest 분류기)
-  2단계 — 유형별 회귀: raw_turbidity → dose_setpoint (각 유형마다 별도 모델)
+  1단계 — 유형 분류: 입력 특성 → water_type (RandomForest 분류기)
+  2단계 — 유형별 회귀: 입력 특성 → 자-테스트 필요 주입률 (유형마다 별도 모델)
 
+학습 목표는 운영자 설정값이 아니라 자-테스트 값(jar_test_dose_mg_per_l)이다.
+운영자 설정값은 하루 한 번만 바뀌어서 지금 탁도와 맞지 않는 때가 많다. 그것을 따라 배우면
+모델도 늦게 반응하는 운영자를 흉내 낼 뿐이다.
+
+입력 특성: 탁도, log(탁도), 조류 보정값 (ai_model.features)
 입력: dataset/train.csv (build_dataset.py 로 생성)
-출력: dataset/models/ 디렉토리
-  - classifier.pkl     유형 분류기
-  - model_normal.pkl   평상시 회귀 모델
-  - model_storm.pkl    호우 회귀 모델
-  - model_algae.pkl    조류 회귀 모델
-  - model_high_turbidity.pkl  고탁도 회귀 모델 (데이터 있을 때만)
+출력: dataset/models/
   - scaler.pkl         입력 정규화 (분류기·회귀 공용)
+  - classifier.pkl     유형 분류기
+  - model_<유형>.pkl   유형별 회귀 모델 (데이터가 있는 유형만)
   - metrics.json       평가 지표
+
+검증 분할: 유형 비율을 지켜 무작위로 20%를 떼어 둔다(stratified). 시간 순서로 뒤쪽을 떼면
+뒤쪽 6일이 평상시뿐이라 호우·조류 모델을 검증할 수 없다. 이 모델은 시간 정보를 입력으로
+쓰지 않으므로 무작위 분할이 시간 순서를 새어 나가게 하지 않는다.
 
 실행:
     cd ~/water_cps
-    pip install scikit-learn --break-system-packages   # 없으면
-    python3 dataset/train_model.py
+    venv/bin/python dataset/train_model.py
 """
 
+import csv
 import json
 import math
 import os
 import pickle
 import sys
+from collections import Counter
 
 WATER_CPS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.chdir(WATER_CPS_DIR)
 sys.path.insert(0, WATER_CPS_DIR)
-
-import csv
-from collections import defaultdict
 
 try:
     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     from sklearn.linear_model import Ridge
-    from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import (
-        mean_absolute_error, mean_squared_error, accuracy_score, classification_report,
+        accuracy_score, classification_report, mean_absolute_error, mean_squared_error,
     )
     from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
 except ImportError:
     print("scikit-learn 이 없습니다. 설치 후 다시 실행하세요:")
-    print("  pip install scikit-learn --break-system-packages")
+    print("  venv/bin/pip install scikit-learn")
     sys.exit(1)
 
+import ai_model  # noqa: E402
+
 TRAIN_CSV = os.path.join(WATER_CPS_DIR, 'dataset', 'train.csv')
-MODEL_DIR = os.path.join(WATER_CPS_DIR, 'dataset', 'models')
+MODEL_DIR = ai_model.MODEL_DIR
 
-# 5시간 delay 이후부터 유효한 데이터 (600걸음 = 18,000초)
+# 5시간 지연 큐가 처음 값으로 차 있는 구간 (600걸음 = 공정 5시간)
 WARMUP_STEPS = 600
+RANDOM_SEED = 42
 
 
-# ---------------------------------------------------------------------------
-# 데이터 로드
-# ---------------------------------------------------------------------------
 def load_data(path: str):
-    """CSV → (X, y_dose, y_type, y_settled) numpy-like 리스트."""
-    rows = []
+    """CSV → (X, y_target, y_type, y_required, y_operator)."""
+    X, y_target, y_type, y_required, y_operator = [], [], [], [], []
     with open(path) as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
+        for i, row in enumerate(csv.DictReader(f)):
             if i < WARMUP_STEPS:
-                continue  # 큐 워밍업 기간 제외
-            rows.append(row)
-
-    print(f"로드: {len(rows):,}행 (워밍업 {WARMUP_STEPS}걸음 제외)")
-
-    X, y_dose, y_type, y_settled = [], [], [], []
-    for r in rows:
-        ntu = float(r['raw_turbidity_ntu'])
-        algae = float(r['algae_extra_mg_per_l'])
-        # 입력 특성: 탁도, log(탁도), 조류 보정값
-        X.append([ntu, math.log(max(ntu, 0.1)), algae])
-        y_dose.append(float(r['dose_setpoint_mg_per_l']))
-        y_type.append(r['water_type'])
-        y_settled.append(float(r['settled_turbidity_ntu']))
-
-    return X, y_dose, y_type, y_settled
+                continue
+            X.append(ai_model.features(float(row['raw_turbidity_ntu']),
+                                       float(row['algae_extra_mg_per_l'])))
+            y_target.append(float(row['jar_test_dose_mg_per_l']))
+            y_type.append(row['water_type'])
+            y_required.append(float(row['required_dose_mg_per_l']))
+            y_operator.append(float(row['dose_setpoint_mg_per_l']))
+    print(f"로드: {len(X):,}행 (워밍업 {WARMUP_STEPS}걸음 제외)")
+    print("유형별: " + ', '.join(f"{k} {v:,}" for k, v in sorted(Counter(y_type).items())))
+    return X, y_target, y_type, y_required, y_operator
 
 
-# ---------------------------------------------------------------------------
-# 훈련
-# ---------------------------------------------------------------------------
+def _pick(values, indexes):
+    return [values[i] for i in indexes]
+
+
 def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
     os.makedirs(model_dir, exist_ok=True)
 
     print("=" * 50)
     print("1. 데이터 로드")
     print("=" * 50)
-    X, y_dose, y_type, y_settled = load_data(csv_path)
+    X, y_target, y_type, y_required, y_operator = load_data(csv_path)
 
-    # 훈련/검증 분할 (시계열이므로 뒷부분을 검증용으로)
-    split = int(len(X) * 0.8)
-    X_train, X_val = X[:split], X[split:]
-    y_dose_train, y_dose_val = y_dose[:split], y_dose[split:]
-    y_type_train, y_type_val = y_type[:split], y_type[split:]
+    all_idx = list(range(len(X)))
+    idx_train, idx_val = train_test_split(
+        all_idx, test_size=0.2, random_state=RANDOM_SEED, stratify=y_type,
+    )
+    print(f"훈련: {len(idx_train):,}행 / 검증: {len(idx_val):,}행 (유형 비율 유지 무작위 분할)")
 
-    print(f"훈련: {len(X_train):,}행 / 검증: {len(X_val):,}행")
-
-    # 정규화
     scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_val_s = scaler.transform(X_val)
+    X_train_s = scaler.fit_transform(_pick(X, idx_train))
+    X_val_s = scaler.transform(_pick(X, idx_val))
+    type_train, type_val = _pick(y_type, idx_train), _pick(y_type, idx_val)
 
-    metrics = {}
+    metrics = {'train_rows': len(idx_train), 'val_rows': len(idx_val),
+               'target': 'jar_test_dose_mg_per_l', 'safety_margin': ai_model.SAFETY_MARGIN}
 
     # -----------------------------------------------------------------------
     print("\n" + "=" * 50)
     print("2. 유형 분류기 훈련 (1단계)")
     print("=" * 50)
-    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    clf.fit(X_train_s, y_type_train)
-
-    y_type_pred = clf.predict(X_val_s)
-    clf_acc = accuracy_score(y_type_val, y_type_pred)
+    clf = RandomForestClassifier(n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+    clf.fit(X_train_s, type_train)
+    type_pred = clf.predict(X_val_s)
+    clf_acc = accuracy_score(type_val, type_pred)
     print(f"분류 정확도: {clf_acc:.4f}")
-    print(classification_report(y_type_val, y_type_pred))
+    print(classification_report(type_val, type_pred, zero_division=0))
     metrics['classifier_accuracy'] = round(clf_acc, 4)
 
     # -----------------------------------------------------------------------
     print("=" * 50)
     print("3. 유형별 회귀 모델 훈련 (2단계)")
     print("=" * 50)
-
-    type_labels = sorted(set(y_type_train))
-    regressors = {}
-    reg_metrics = {}
-
-    for label in type_labels:
-        # 훈련 데이터 필터
-        idx_tr = [i for i, t in enumerate(y_type_train) if t == label]
-        idx_va = [i for i, t in enumerate(y_type_val) if t == label]
-
-        if len(idx_tr) < 10:
-            print(f"  [{label}] 데이터 부족 ({len(idx_tr)}행) — 건너뜀")
+    regressors, reg_metrics = {}, {}
+    for label in sorted(set(type_train)):
+        tr = [k for k, t in enumerate(type_train) if t == label]
+        va = [k for k, t in enumerate(type_val) if t == label]
+        if len(tr) < 10:
+            print(f"  [{label}] 데이터 부족 ({len(tr)}행) — 건너뜀")
             continue
 
-        Xtr = [X_train_s[i] for i in idx_tr]
-        ytr = [y_dose_train[i] for i in idx_tr]
-        Xva = [X_val_s[i] for i in idx_va] if idx_va else []
-        yva = [y_dose_val[i] for i in idx_va] if idx_va else []
-
-        # 유형별 모델 선택
-        if label == 'normal':
-            reg = Ridge(alpha=1.0)  # 평상시: 선형 충분
-        else:
-            reg = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-
-        reg.fit(Xtr, ytr)
+        # 평상시는 탁도 범위가 좁아 선형으로 충분하다. 호우·조류는 범위가 넓어 비선형 모델을 쓴다.
+        reg = Ridge(alpha=1.0) if label == 'normal' else RandomForestRegressor(
+            n_estimators=100, min_samples_leaf=5, random_state=RANDOM_SEED, n_jobs=-1)
+        reg.fit(_pick(X_train_s, tr), _pick(_pick(y_target, idx_train), tr))
         regressors[label] = reg
 
-        if Xva:
-            y_pred = reg.predict(Xva)
-            mae = mean_absolute_error(yva, y_pred)
-            rmse = math.sqrt(mean_squared_error(yva, y_pred))
-            print(f"  [{label}] 훈련 {len(idx_tr):,}행 / 검증 {len(idx_va):,}행 "
-                  f"| MAE={mae:.4f} mg/L, RMSE={rmse:.4f} mg/L")
-            reg_metrics[label] = {'mae': round(mae, 4), 'rmse': round(rmse, 4),
-                                  'train_rows': len(idx_tr), 'val_rows': len(idx_va)}
-        else:
-            print(f"  [{label}] 훈련 {len(idx_tr):,}행 (검증 데이터 없음)")
-            reg_metrics[label] = {'train_rows': len(idx_tr), 'val_rows': 0}
-
+        pred = reg.predict(_pick(X_val_s, va))
+        truth = _pick(_pick(y_required, idx_val), va)
+        mae = mean_absolute_error(truth, pred)
+        rmse = math.sqrt(mean_squared_error(truth, pred))
+        print(f"  [{label}] 훈련 {len(tr):,}행 / 검증 {len(va):,}행 | "
+              f"참 필요 주입률 대비 MAE={mae:.3f}, RMSE={rmse:.3f} mg/L")
+        reg_metrics[label] = {'train_rows': len(tr), 'val_rows': len(va),
+                              'mae_vs_required': round(mae, 4), 'rmse_vs_required': round(rmse, 4)}
     metrics['regressors'] = reg_metrics
 
     # -----------------------------------------------------------------------
     print("\n" + "=" * 50)
-    print("4. 모델 저장")
+    print("4. 운영자와 비교 (검증 데이터, 참 필요 주입률 대비)")
+    print("=" * 50)
+    # 분류기가 고른 유형의 모델로 예측한다. 실제로 쓸 때와 같은 경로다.
+    model_pred = []
+    for row_s, label in zip(X_val_s, type_pred):
+        label = str(label)
+        model_pred.append(float(regressors[label].predict([row_s])[0]) if label in regressors
+                          else float('nan'))
+    required_val = _pick(y_required, idx_val)
+    operator_val = _pick(y_operator, idx_val)
+    ok = [k for k, p in enumerate(model_pred) if not math.isnan(p)]
+    ai_mae = mean_absolute_error(_pick(required_val, ok), _pick(model_pred, ok))
+    # 운영자 설정값에는 과주입 여유가 들어 있으므로, 공정하게 비교하려고 AI 쪽에도 같은 여유를 더한 값을 본다
+    ai_set = [p + ai_model.SAFETY_MARGIN for p in _pick(model_pred, ok)]
+    ai_under = sum(1 for s, r in zip(ai_set, _pick(required_val, ok)) if s < r) / len(ok)
+    op_under = sum(1 for s, r in zip(operator_val, required_val) if s < r) / len(required_val)
+    op_mae = mean_absolute_error(required_val, operator_val)
+    print(f"  AI 필요 주입률 예측 MAE        {ai_mae:.3f} mg/L")
+    print(f"  운영자 설정값 − 필요 주입률 MAE {op_mae:.3f} mg/L  (과주입 여유 2 mg/L 포함)")
+    print(f"  설정값이 필요 주입률보다 모자란 비율  AI {ai_under*100:.2f}%  운영자 {op_under*100:.2f}%")
+    metrics['comparison'] = {
+        'ai_mae_vs_required': round(ai_mae, 4),
+        'operator_mae_vs_required': round(op_mae, 4),
+        'ai_underdose_ratio': round(ai_under, 4),
+        'operator_underdose_ratio': round(op_under, 4),
+    }
+
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 50)
+    print("5. 모델 저장")
     print("=" * 50)
 
     def save(obj, name):
@@ -181,57 +187,30 @@ def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
     save(clf, 'classifier.pkl')
     for label, reg in regressors.items():
         save(reg, f'model_{label}.pkl')
-
-    metrics_path = os.path.join(model_dir, 'metrics.json')
-    with open(metrics_path, 'w') as f:
+    with open(os.path.join(model_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
-    print(f"  저장: {metrics_path}")
-
-    print("\n완료.")
+    print(f"  저장: {os.path.join(model_dir, 'metrics.json')}")
     return metrics
 
 
-# ---------------------------------------------------------------------------
-# 간단 추론 테스트
-# ---------------------------------------------------------------------------
-def predict(raw_turbidity_ntu: float, algae_extra: float = 0.0,
-            model_dir: str = MODEL_DIR) -> dict:
-    """저장된 모델로 주입률을 예측한다. 테스트용."""
-    def load(name):
-        with open(os.path.join(model_dir, name), 'rb') as f:
-            return pickle.load(f)
-
-    scaler = load('scaler.pkl')
-    clf = load('classifier.pkl')
-
-    ntu = raw_turbidity_ntu
-    x = scaler.transform([[ntu, math.log(max(ntu, 0.1)), algae_extra]])
-
-    water_type = clf.predict(x)[0]
-    model_file = f'model_{water_type}.pkl'
-    reg = load(model_file)
-    dose = reg.predict(x)[0]
-
-    return {
-        'water_type': water_type,
-        'predicted_dose_mg_per_l': round(dose, 4),
-    }
+def predict(raw_turbidity_ntu: float, algae_extra: float = 0.0, model_dir: str = MODEL_DIR) -> dict:
+    """저장된 모델로 예측한다. 테스트용."""
+    scaler, clf, regressors = ai_model.load_models(model_dir)
+    required, water_type = ai_model.predict_required(raw_turbidity_ntu, algae_extra,
+                                                     scaler, clf, regressors)
+    return {'water_type': water_type,
+            'predicted_required_mg_per_l': None if required is None else round(required, 3),
+            'setpoint_mg_per_l': None if required is None else round(required + ai_model.SAFETY_MARGIN, 3)}
 
 
 if __name__ == '__main__':
-    metrics = train()
+    train()
 
     print("\n" + "=" * 50)
-    print("5. 추론 샘플 테스트")
+    print("6. 추론 샘플 테스트")
     print("=" * 50)
-    test_cases = [
-        (6.0, 0.0, '평상시'),
-        (50.0, 0.0, '고탁도'),
-        (300.0, 0.0, '호우'),
-        (6.0, 5.0, '조류'),
-    ]
-    for ntu, algae, desc in test_cases:
-        result = predict(ntu, algae)
-        print(f"  {desc} (탁도={ntu} NTU, 조류={algae}) → "
-              f"유형={result['water_type']}, "
-              f"예측 주입률={result['predicted_dose_mg_per_l']} mg/L")
+    for ntu, algae, desc in [(6.0, 0.0, '평상시'), (50.0, 0.0, '호우 오름'),
+                             (300.0, 0.0, '호우 정점'), (6.0, 5.0, '조류')]:
+        r = predict(ntu, algae)
+        print(f"  {desc} (탁도={ntu} NTU, 조류={algae}) → 유형={r['water_type']}, "
+              f"필요 주입률 예측={r['predicted_required_mg_per_l']}, 설정값={r['setpoint_mg_per_l']} mg/L")
