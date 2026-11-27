@@ -73,12 +73,13 @@ def _settled_turbidity(dose_difference: float) -> float:
 # ---------------------------------------------------------------------------
 # SQLite 헬퍼
 # ---------------------------------------------------------------------------
-def _put(name: str, pid: int, value) -> None:
-    with sqlite3.connect(STATE['path']) as conn:
-        conn.execute(
-            'UPDATE water_cps SET value = ? WHERE name = ? AND pid = ?',
-            (str(value), name, pid),
-        )
+def _put(conn: sqlite3.Connection, name: str, pid: int, value) -> None:
+    # 연결은 build()에서 한 번만 연다. 걸음마다 새로 열면 연결이 닫히지 않고 쌓여
+    # 파일 핸들 한도를 넘는다 ("unable to open database file").
+    conn.execute(
+        'UPDATE water_cps SET value = ? WHERE name = ? AND pid = ?',
+        (str(value), name, pid),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,19 @@ def build(days: int = DEFAULT_DAYS, out_path: str = DEFAULT_OUT) -> None:
     diff_queue = collections.deque([initial_diff] * QUEUE_LENGTH)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    conn = sqlite3.connect(STATE['path'])
+    try:
+        _write_rows(total_steps, out_path, conn, scenario, policy, level, intake_pump,
+                    chemical_pump_command, diff_queue)
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"완료: {total_steps:,}행 → {out_path}")
+
+
+def _write_rows(total_steps, out_path, conn, scenario, policy, level, intake_pump,
+                chemical_pump_command, diff_queue):
     with open(out_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(COLUMNS)
@@ -148,7 +162,7 @@ def build(days: int = DEFAULT_DAYS, out_path: str = DEFAULT_OUT) -> None:
                 intake_pump = 1
 
             # 7. 상태 표 갱신 (원수 탁도 외부 주입)
-            _put('AIT101', 1, ntu)
+            _put(conn, 'AIT101', 1, ntu)
 
             # 8. CSV 기록
             writer.writerow([
@@ -162,8 +176,6 @@ def build(days: int = DEFAULT_DAYS, out_path: str = DEFAULT_OUT) -> None:
                 pct = (step_number + 1) / total_steps * 100
                 print(f"  {pct:5.1f}% — sim_time={sim_time/3600:.1f}h, "
                       f"ntu={ntu:.1f}, type={water_type}, setpoint={setpoint:.2f} mg/L")
-
-    print(f"완료: {total_steps:,}행 → {out_path}")
 
 
 if __name__ == '__main__':
