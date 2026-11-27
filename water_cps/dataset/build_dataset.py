@@ -13,7 +13,9 @@ PLC1·PLC2 역할(수위 제어, 유량 × 주입률 ÷ 1000)도 이 스크립�
 
 출력 CSV 열:
     sim_time_seconds        공정 시각 (초)
-    raw_turbidity_ntu       원수 탁도
+    raw_turbidity_ntu       원수 탁도 (참값. 공정이 쓰는 값)
+    measured_turbidity_ntu  탁도계가 읽은 원수 탁도 (참값 × 측정 오차). 모델 입력
+    turbidity_trend         측정 탁도의 1시간 전 대비 log 변화량. 모델 입력
     algae_extra_mg_per_l    조류 추가 주입률 (보정용)
     water_type              유형 레이블
     dose_setpoint_mg_per_l  운영자 설정 주입률 (하루 한 번 자-테스트로 갱신, 비교용)
@@ -46,6 +48,7 @@ from config import (  # noqa: E402
     SETTLING_DELAY_SECONDS, TANK_AREA, TANK_HEIGHT, UNDERDOSE_COEFFICIENT,
 )
 from scenarios import default_scenario, raw_conditions  # noqa: E402
+import ai_model  # noqa: E402
 from operator_policy import OperatorPolicy  # noqa: E402
 
 DEFAULT_DAYS = 30
@@ -54,6 +57,8 @@ QUEUE_LENGTH = SETTLING_DELAY_SECONDS // PROCESS_STEP_SECONDS  # 600
 
 # 자-테스트 측정 오차 (표준편차, mg/L). 비커 실험은 할 때마다 조금씩 다르게 나온다.
 JAR_TEST_NOISE_MG_PER_L = 0.5
+# 탁도계 측정 오차 (표준편차, 읽은 값의 비율). 온라인 탁도계 정확도 ±2% 수준.
+SENSOR_NOISE_RATIO = 0.02
 RANDOM_SEED = 42
 
 
@@ -76,11 +81,17 @@ def _settled_turbidity(dose_difference: float) -> float:
     return SETTLED_TURBIDITY_BASE + OVERDOSE_COEFFICIENT * dose_difference
 
 
+def measure(true_ntu: float, rng: random.Random) -> float:
+    """탁도계가 읽는 값: 참값에 비율 오차를 곱한다."""
+    return max(0.0, true_ntu * (1.0 + rng.gauss(0.0, SENSOR_NOISE_RATIO)))
+
+
 # ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
 COLUMNS = [
-    'sim_time_seconds', 'raw_turbidity_ntu', 'algae_extra_mg_per_l', 'water_type',
+    'sim_time_seconds', 'raw_turbidity_ntu', 'measured_turbidity_ntu', 'turbidity_trend',
+    'algae_extra_mg_per_l', 'water_type',
     'dose_setpoint_mg_per_l', 'actual_dose_mg_per_l', 'required_dose_mg_per_l',
     'jar_test_dose_mg_per_l', 'settled_turbidity_ntu', 'dosed_ph', 'level_m',
 ]
@@ -91,6 +102,7 @@ def build(days: int = DEFAULT_DAYS, out_path: str = DEFAULT_OUT, seed: int = RAN
     print(f"데이터 생성 시작: {days}일 ({total_steps:,} 걸음) → {out_path}")
 
     rng = random.Random(seed)
+    trend = ai_model.TurbidityTrend()
     scenario = default_scenario()
     policy = OperatorPolicy(overdose=2.0, jar_test_hours=(9,))
 
@@ -112,13 +124,15 @@ def build(days: int = DEFAULT_DAYS, out_path: str = DEFAULT_OUT, seed: int = RAN
             # 1. 원수 조건
             ntu, algae_extra, water_type = raw_conditions(sim_time, scenario)
             type_counts[water_type] += 1
+            measured = measure(ntu, rng)
+            turbidity_trend = trend.update(sim_time, measured)
 
             # 2. 필요 주입률 (조류 보정 포함)과 자-테스트 측정값
             needed = _required_dose(ntu) + algae_extra
             jar_test = needed + rng.gauss(0.0, JAR_TEST_NOISE_MG_PER_L)
 
             # 3. 운영자 설정값 (하루 한 번 자-테스트, 탁도 급등 시 비상 주입)
-            setpoint = policy.setpoint_at(sim_time, needed, ntu)
+            setpoint = policy.setpoint_at(sim_time, needed, measured)
 
             # 4. PLC2 역할: 유량 × 주입률 ÷ 1000
             chemical_pump_command = min(max(round(PRODUCTION_FLOW * setpoint / 1000, 4), 0.0),
@@ -143,7 +157,8 @@ def build(days: int = DEFAULT_DAYS, out_path: str = DEFAULT_OUT, seed: int = RAN
 
             # 8. CSV 기록
             writer.writerow([
-                sim_time, round(ntu, 4), round(algae_extra, 4), water_type,
+                sim_time, round(ntu, 4), round(measured, 4), round(turbidity_trend, 5),
+                round(algae_extra, 4), water_type,
                 round(setpoint, 4), round(actual_dose, 4), round(needed, 4),
                 round(jar_test, 4), round(settled, 4), round(ph, 4), round(level, 4),
             ])

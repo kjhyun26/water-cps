@@ -8,12 +8,13 @@
 운영자 설정값은 하루 한 번만 바뀌어서 지금 탁도와 맞지 않는 때가 많다. 그것을 따라 배우면
 모델도 늦게 반응하는 운영자를 흉내 낼 뿐이다.
 
-입력 특성: 탁도, log(탁도), 조류 보정값 (ai_model.features)
+입력 특성: 측정 탁도, log(측정 탁도), 탁도 변화율(1시간), 조류 보정값 (ai_model.features)
 입력: dataset/train.csv (build_dataset.py 로 생성)
 출력: dataset/models/
   - scaler.pkl         입력 정규화 (분류기·회귀 공용)
   - classifier.pkl     유형 분류기
   - model_<유형>.pkl   유형별 회귀 모델 (데이터가 있는 유형만)
+  - guard.json         AI1 학습 범위, AI2 불확실성 기준 (ai_model.make_guard)
   - metrics.json       평가 지표
 
 검증 분할: 유형 비율을 지켜 무작위로 20%를 떼어 둔다(stratified). 시간 순서로 뒤쪽을 떼면
@@ -66,7 +67,9 @@ def load_data(path: str):
         for i, row in enumerate(csv.DictReader(f)):
             if i < WARMUP_STEPS:
                 continue
-            X.append(ai_model.features(float(row['raw_turbidity_ntu']),
+            # 모델은 탁도계가 읽은 값(측정 오차 포함)만 본다. 참값은 평가에만 쓴다
+            X.append(ai_model.features(float(row['measured_turbidity_ntu']),
+                                       float(row['turbidity_trend']),
                                        float(row['algae_extra_mg_per_l'])))
             y_target.append(float(row['jar_test_dose_mg_per_l']))
             y_type.append(row['water_type'])
@@ -127,7 +130,7 @@ def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
             print(f"  [{label}] 데이터 부족 ({len(tr)}행) — 건너뜀")
             continue
 
-        # 평상시는 탁도 범위가 좁아 선형으로 충분하다. 호우·조류는 범위가 넓어 비선형 모델을 쓴다.
+        # 평상시는 탁도 범위가 좁아 선형으로 충분하다. 나머지는 범위가 넓어 비선형 모델을 쓴다.
         reg = Ridge(alpha=1.0) if label == 'normal' else RandomForestRegressor(
             n_estimators=100, min_samples_leaf=5, random_state=RANDOM_SEED, n_jobs=-1)
         reg.fit(_pick(X_train_s, tr), _pick(_pick(y_target, idx_train), tr))
@@ -142,6 +145,26 @@ def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
         reg_metrics[label] = {'train_rows': len(tr), 'val_rows': len(va),
                               'mae_vs_required': round(mae, 4), 'rmse_vs_required': round(rmse, 4)}
     metrics['regressors'] = reg_metrics
+
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 50)
+    print("3-1. AI1·AI2 기준 정하기")
+    print("=" * 50)
+    spreads = []
+    for label, reg in regressors.items():
+        tr = [k for k, t in enumerate(type_train) if t == label]
+        spreads += list(ai_model.tree_spread(reg, _pick(X_train_s, tr)))
+    guard = ai_model.make_guard(_pick(X, idx_train), spreads)
+    print("  AI1 범위: " + ', '.join(f"{n} {lo:.3g}~{hi:.3g}" for n, lo, hi in
+                                     zip(guard['feature_names'], guard['low'], guard['high'])))
+    print(f"  AI2 유형 확신 기준 {guard['type_confidence_min']}, "
+          f"나무 편차 기준 {guard['tree_spread_limit']:.3f} mg/L")
+    val_results = ai_model.assess_batch(_pick(X, idx_val), scaler, clf, regressors, guard)
+    rate = {flag: sum(1 for r in val_results if flag in r['flags']) / len(val_results)
+            for flag in ('AI1_NO_DECREASE', 'AI2_TYPE', 'AI2_SPREAD')}
+    print("  검증 데이터에서 걸린 비율 (평소 상황이라 낮아야 한다): "
+          + ', '.join(f"{k} {v*100:.2f}%" for k, v in rate.items()))
+    metrics['guard_rates_on_validation'] = {k: round(v, 4) for k, v in rate.items()}
 
     # -----------------------------------------------------------------------
     print("\n" + "=" * 50)
@@ -183,6 +206,9 @@ def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
             pickle.dump(obj, f)
         print(f"  저장: {path}")
 
+    with open(os.path.join(model_dir, ai_model.GUARD_FILE), 'w') as f:
+        json.dump(guard, f, ensure_ascii=False, indent=2)
+    print(f"  저장: {os.path.join(model_dir, ai_model.GUARD_FILE)}")
     save(scaler, 'scaler.pkl')
     save(clf, 'classifier.pkl')
     for label, reg in regressors.items():
@@ -193,13 +219,16 @@ def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
     return metrics
 
 
-def predict(raw_turbidity_ntu: float, algae_extra: float = 0.0, model_dir: str = MODEL_DIR) -> dict:
-    """저장된 모델로 예측한다. 테스트용."""
+def predict(raw_turbidity_ntu: float, trend: float = 0.0, algae_extra: float = 0.0,
+            model_dir: str = MODEL_DIR) -> dict:
+    """저장된 모델과 AI1·AI2 로 판단한다. 테스트용."""
     scaler, clf, regressors = ai_model.load_models(model_dir)
-    required, water_type = ai_model.predict_required(raw_turbidity_ntu, algae_extra,
-                                                     scaler, clf, regressors)
-    return {'water_type': water_type,
-            'predicted_required_mg_per_l': None if required is None else round(required, 3),
+    guard = ai_model.load_guard(model_dir)
+    r = ai_model.assess(ai_model.features(raw_turbidity_ntu, trend, algae_extra),
+                        scaler, clf, regressors, guard)
+    required = r['required']
+    return {'water_type': r['water_type'], 'confidence': round(r['confidence'], 2),
+            'flags': r['flags'],
             'setpoint_mg_per_l': None if required is None else round(required + ai_model.SAFETY_MARGIN, 3)}
 
 
@@ -209,8 +238,12 @@ if __name__ == '__main__':
     print("\n" + "=" * 50)
     print("6. 추론 샘플 테스트")
     print("=" * 50)
-    for ntu, algae, desc in [(6.0, 0.0, '평상시'), (50.0, 0.0, '호우 오름'),
-                             (300.0, 0.0, '호우 정점'), (6.0, 5.0, '조류')]:
-        r = predict(ntu, algae)
-        print(f"  {desc} (탁도={ntu} NTU, 조류={algae}) → 유형={r['water_type']}, "
-              f"필요 주입률 예측={r['predicted_required_mg_per_l']}, 설정값={r['setpoint_mg_per_l']} mg/L")
+    for ntu, trend, algae, desc in [(6.0, 0.0, 0.0, '평상시'), (50.0, 1.3, 0.0, '호우 오름'),
+                                    (300.0, 0.0, 0.0, '호우 정점'), (80.0, 0.0, 0.0, '고탁도 머묾'),
+                                    (6.0, 0.0, 5.0, '조류'),
+                                    (900.0, 0.0, 0.0, '처음 보는 탁도 (AI1)'),
+                                    (6.0, 3.0, 0.0, '처음 보는 변화율 (AI1)'),
+                                    (80.0, 0.3, 0.0, '호우·고탁도 애매 (AI2)')]:
+        r = predict(ntu, trend, algae)
+        print(f"  {desc} (탁도={ntu}, 변화율={trend}, 조류={algae}) → 유형={r['water_type']}"
+              f"({r['confidence']}), 설정값={r['setpoint_mg_per_l']} mg/L {r['flags'] or ''}")

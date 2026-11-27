@@ -33,6 +33,17 @@ class StormEvent:
 
 
 @dataclass
+class HighTurbidityEvent:
+    """호우 없는 고탁도 기간 (상류 공사·준설, 저수지 바닥 교란 등).
+    호우보다 천천히 올라 오래 머문다. 탁도 변화율로 호우와 구분된다."""
+    start_seconds: float       # 시작 공정 시각 (초)
+    peak_ntu: float            # 머무는 탁도 (NTU)
+    rise_hours: float = 12.0   # 오르는 시간
+    hold_hours: float = 36.0   # 머무는 시간
+    fall_hours: float = 12.0   # 내려오는 시간
+
+
+@dataclass
 class AlgaeEvent:
     """조류 이벤트. 탁도는 그대로지만 필요 주입률이 추가로 오른다.
     실제 모델에서는 조류 영향을 required_dose()에 외부 보정값으로 더해야 한다.
@@ -49,11 +60,12 @@ class Scenario:
     base_turbidity: float = 6.0           # 평상시 기준 탁도 (NTU)
     daily_amplitude: float = 1.0          # 하루 주기 흔들림 폭 (NTU)
     storms: List[StormEvent] = field(default_factory=list)
+    high_turbidity_events: List[HighTurbidityEvent] = field(default_factory=list)
     algae_events: List[AlgaeEvent] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# 기본 시나리오 (30일, 호우 3번, 조류 1번)
+# 기본 시나리오 (30일, 호우 3번, 고탁도 1번, 조류 1번)
 # ---------------------------------------------------------------------------
 def default_scenario() -> Scenario:
     """설계 문서 9-3절 참고. 도메인 문서 4-6절의 수질 패턴을 반영한다."""
@@ -64,6 +76,11 @@ def default_scenario() -> Scenario:
             StormEvent(start_seconds=5 * 86400, peak_ntu=300.0),   # 5일째 호우 (고탁도)
             StormEvent(start_seconds=14 * 86400, peak_ntu=150.0),  # 14일째 중탁도 호우
             StormEvent(start_seconds=23 * 86400, peak_ntu=400.0),  # 23일째 대형 호우
+        ],
+        high_turbidity_events=[
+            # 9일째 고탁도: 12시간에 걸쳐 80 NTU까지 올라 36시간 머문다.
+            # 운영자 비상 기준(100 NTU)보다 낮아 운영자는 다음 자-테스트까지 늦게 따라간다
+            HighTurbidityEvent(start_seconds=9 * 86400, peak_ntu=80.0),
         ],
         algae_events=[
             AlgaeEvent(
@@ -84,7 +101,8 @@ def raw_conditions(sim_time_seconds: float, scenario: Scenario) -> Tuple[float, 
     탁도 계산 순서:
     1. 기준 탁도 + 하루 주기 흔들림
     2. 호우 기여분 (여러 호우가 겹치면 최댓값)
-    3. 유형 판정 및 조류 추가 주입률 계산
+    3. 고탁도 기여분
+    4. 조류 추가 주입률, 유형 판정
 
     Args:
         sim_time_seconds: 공정 시각 (초). config.PROCESS_STEP_SECONDS 단위로 증가.
@@ -115,38 +133,54 @@ def raw_conditions(sim_time_seconds: float, scenario: Scenario) -> Tuple[float, 
             contribution = storm.peak_ntu * (scenario.base_turbidity / storm.peak_ntu) ** t
             storm_contribution = max(storm_contribution, contribution)
 
-    # 호우가 실제로 탁도를 정할 때만 호우로 본다. 호우 꼬리에서 탁도가 평상시 수준으로
-    # 돌아온 뒤까지 호우라고 부르면, 탁도만 보는 분류기가 배울 수 없는 레이블이 된다.
-    storm_dominant = storm_contribution > value
-    value = max(value, storm_contribution)
+    # 3. 고탁도 기여분
+    high_contribution = 0.0
+    base = scenario.base_turbidity
+    for event in scenario.high_turbidity_events:
+        since_hours = (sim_time_seconds - event.start_seconds) / 3600.0
+        hold_end = event.rise_hours + event.hold_hours
+        if 0 <= since_hours < event.rise_hours:
+            contribution = base * (event.peak_ntu / base) ** (since_hours / event.rise_hours)
+        elif event.rise_hours <= since_hours < hold_end:
+            contribution = event.peak_ntu
+        elif hold_end <= since_hours < hold_end + event.fall_hours:
+            contribution = event.peak_ntu * (base / event.peak_ntu) ** ((since_hours - hold_end) / event.fall_hours)
+        else:
+            continue
+        high_contribution = max(high_contribution, contribution)
 
-    # 3. 조류 추가 주입률
+    # 사건이 실제로 탁도를 정할 때만 그 유형으로 본다. 사건 꼬리에서 탁도가 평상시 수준으로
+    # 돌아온 뒤까지 호우라고 부르면, 센서로 배울 수 없는 레이블이 된다.
+    storm_dominant = storm_contribution > value and storm_contribution >= high_contribution
+    high_dominant = high_contribution > value and not storm_dominant
+    value = max(value, storm_contribution, high_contribution)
+
+    # 4. 조류 추가 주입률
     algae_extra = 0.0
     for event in scenario.algae_events:
         if event.start_seconds <= sim_time_seconds < event.end_seconds:
             algae_extra = max(algae_extra, event.extra_dose_mg_per_l)
 
-    # 4. 유형 판정
-    label = _classify(value, storm_dominant, algae_extra)
+    # 5. 유형 판정
+    label = _classify(storm_dominant, high_dominant, algae_extra)
 
     return round(value, 4), round(algae_extra, 4), label
 
 
-def _classify(turbidity: float, storm_dominant: bool, algae_extra: float) -> str:
-    """탁도와 이벤트 정보로 유형 레이블을 결정한다.
+def _classify(storm_dominant: bool, high_dominant: bool, algae_extra: float) -> str:
+    """이벤트 정보로 유형 레이블을 결정한다.
 
-    우선순위: 호우 > 조류 > 고탁도 > 평상시
+    우선순위: 호우 > 고탁도 > 조류 > 평상시
     호우: 호우 기여분이 평상시 탁도보다 커서 탁도를 정하고 있음
+    고탁도: 고탁도 사건 기여분이 탁도를 정하고 있음 (호우 없이)
     조류: algae_extra > 0
-    고탁도: 탁도 ≥ 50 NTU (호우 없이). 기본 시나리오에서는 50 NTU를 넘는 때가 모두
-          호우 중이라 나오지 않는다.
     """
     if storm_dominant:
         return TYPE_STORM
+    if high_dominant:
+        return TYPE_HIGH_TURBIDITY
     if algae_extra > 0:
         return TYPE_ALGAE
-    if turbidity >= 50.0:
-        return TYPE_HIGH_TURBIDITY
     return TYPE_NORMAL
 
 
@@ -175,6 +209,11 @@ def _self_check():
     ntu_algae, extra_algae, label_algae = raw_conditions(19 * 86400, s)
     assert label_algae == TYPE_ALGAE, f"expected algae, got {label_algae}"
     assert extra_algae == 5.0
+
+    # 고탁도 머무는 기간: 9일 + 24시간
+    ntu_high, _, label_high = raw_conditions(9 * 86400 + 24 * 3600, s)
+    assert label_high == TYPE_HIGH_TURBIDITY, f"expected high_turbidity, got {label_high}"
+    assert abs(ntu_high - 80.0) < 0.01
 
 
 _self_check()

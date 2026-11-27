@@ -1,5 +1,6 @@
 """운영자 정책과 AI 정책을 같은 30일 원수 시나리오로 돌려 결과를 비교한다.
 
+원수 시나리오는 학습 때와 같고, 탁도계 측정 오차는 다른 난수로 새로 만든다.
 공정 수식은 build_dataset.py 와 같다 (MiniCPS 없이 빠르게 계산).
 비교 항목:
     침전수 탁도가 1.0 NTU를 넘은 시간 비율과 최댓값
@@ -17,6 +18,7 @@ AI 정책은 두 가지로 돌린다.
 
 import collections
 import os
+import random
 import sys
 
 WATER_CPS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +26,7 @@ sys.path.insert(0, WATER_CPS_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ai_model  # noqa: E402
-from build_dataset import _required_dose, _settled_turbidity  # noqa: E402
+from build_dataset import _required_dose, _settled_turbidity, measure  # noqa: E402
 from config import (  # noqa: E402
     CHEMICAL_PUMP_MAX, INITIAL_DOSE_SETPOINT, INITIAL_RAW_TURBIDITY, PROCESS_STEP_SECONDS,
     PRODUCTION_FLOW, SETTLING_DELAY_SECONDS, TURBIDITY_ALARM_MINUTES, TURBIDITY_LIMIT,
@@ -36,18 +38,23 @@ DAYS = 30
 QUEUE_LENGTH = SETTLING_DELAY_SECONDS // PROCESS_STEP_SECONDS
 
 
-def _ai_setpoints(conditions, use_algae, scaler, clf, regressors):
+def _ai_setpoints(conditions, measured, trends, use_algae, scaler, clf, regressors):
     """걸음마다 AI 설정값. 입력이 같으면 출력도 같으므로 한 번에 묶어 예측한다."""
-    rows = [ai_model.features(ntu, algae if use_algae else 0.0) for ntu, algae, _ in conditions]
-    x = scaler.transform(rows)
-    labels = [str(label) for label in clf.predict(x)]
-    setpoints = [None] * len(rows)
-    for label in set(labels):
-        idx = [i for i, l in enumerate(labels) if l == label]
-        pred = regressors[label].predict(x[idx])
-        for i, p in zip(idx, pred):
-            setpoints[i] = float(p) + ai_model.SAFETY_MARGIN
-    return setpoints
+    rows = [ai_model.features(m, t, algae if use_algae else 0.0)
+            for (_, algae, _), m, t in zip(conditions, measured, trends)]
+    # 에이전트와 같은 판단(AI1·AI2·F1). AI1 이면 직전 설정값보다 줄이지 않는다
+    results = ai_model.assess_batch(rows, scaler, clf, regressors, ai_model.load_guard())
+    setpoints, previous = [], INITIAL_DOSE_SETPOINT
+    for r in results:
+        if r['required'] is not None:
+            value = r['required'] + ai_model.SAFETY_MARGIN
+            if r['ood']:
+                value = max(value, previous)
+            previous = min(max(value, 5.0), 50.0)   # F1
+        setpoints.append(previous)
+    flagged = {f: sum(1 for r in results if f in r['flags'])
+               for f in ('AI1_NO_DECREASE', 'AI2_TYPE', 'AI2_SPREAD')}
+    return setpoints, flagged
 
 
 def simulate(conditions, setpoints):
@@ -80,23 +87,32 @@ def main():
     scenario = default_scenario()
     steps = DAYS * 86400 // PROCESS_STEP_SECONDS
     conditions = [raw_conditions(i * PROCESS_STEP_SECONDS, scenario) for i in range(steps)]
+    # 운영자와 AI 모두 같은 탁도계 값(측정 오차 포함)을 본다. 학습 데이터와 다른 난수로 만든다
+    rng = random.Random(7)
+    measured = [measure(ntu, rng) for ntu, _, _ in conditions]
+    trend = ai_model.TurbidityTrend()
+    trends = [trend.update(i * PROCESS_STEP_SECONDS, m) for i, m in enumerate(measured)]
 
     policy = OperatorPolicy(overdose=2.0, jar_test_hours=(9,))
-    operator = [policy.setpoint_at(i * PROCESS_STEP_SECONDS, _required_dose(ntu) + algae, ntu)
-                for i, (ntu, algae, _) in enumerate(conditions)]
+    operator = [policy.setpoint_at(i * PROCESS_STEP_SECONDS, _required_dose(ntu) + algae, m)
+                for i, ((ntu, algae, _), m) in enumerate(zip(conditions, measured))]
 
     scaler, clf, regressors = ai_model.load_models()
+    with_algae, flags_with = _ai_setpoints(conditions, measured, trends, True, scaler, clf, regressors)
+    without_algae, _ = _ai_setpoints(conditions, measured, trends, False, scaler, clf, regressors)
     results = {
         '운영자 (하루 1회 자-테스트)': simulate(conditions, operator),
-        'AI (조류 정보 있음)': simulate(conditions, _ai_setpoints(conditions, True, scaler, clf, regressors)),
-        'AI (조류 정보 없음)': simulate(conditions, _ai_setpoints(conditions, False, scaler, clf, regressors)),
+        'AI (조류 정보 있음)': simulate(conditions, with_algae),
+        'AI (조류 정보 없음)': simulate(conditions, without_algae),
     }
 
-    print(f"{DAYS}일 시나리오 (호우 3번, 조류 1번) 결과")
+    print(f"{DAYS}일 시나리오 (호우 3번, 고탁도 1번, 조류 1번) 결과")
     print(f"{'정책':<22}{'1 NTU 초과 시간':>14}{'최대 침전수 탁도':>16}{'PLC3 경보':>10}{'약품 사용량':>12}")
     for name, r in results.items():
         print(f"{name:<22}{r['over_ratio']*100:>13.2f}%{r['max_settled']:>13.2f} NTU"
               f"{r['alarms']:>9}번{r['chemical_t']:>10.1f} t")
+    print("AI (조류 정보 있음)에서 보안 조치가 걸린 걸음 수: "
+          + ', '.join(f"{k} {v:,}" for k, v in flags_with.items()) + f" / {steps:,}")
 
 
 if __name__ == '__main__':
