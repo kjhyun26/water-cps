@@ -20,6 +20,9 @@ import init  # noqa: E402
 VENV_PYTHON = os.path.abspath('venv/bin/python')
 HOST_NAMES = ['plc1', 'plc2', 'plc3', 'sis', 'hmi']
 
+# AI 에이전트 사용 여부 (True: ai_agent.py 로 DOSE_SETPOINT 자동 제어, False: hmi.py 수동)
+USE_AI_AGENT = True
+
 
 class WaterTopology(Topo):
     def build(self):
@@ -77,7 +80,10 @@ def start_devices(network):
     wait_until_ready(['plc2'])
     # 공정은 마지막에 띄운다. 장치가 준비되기 전에는 공정 시각이 흐르지 않게 하려는 것이다
     launch(network.get('s1'), 'physical_process.py', 'process')
-    launch(network.get('hmi'), 'hmi.py', 'hmi')
+    if USE_AI_AGENT:
+        launch(network.get('hmi'), 'ai_agent.py', 'ai_agent')
+    else:
+        launch(network.get('hmi'), 'hmi.py', 'hmi')
 
 
 def stop(network):
@@ -90,7 +96,11 @@ def main():
     try:
         start_devices(network)
         print('*** 화면: 다른 터미널에서  watch -n 1 cat %s' % os.path.abspath(config.HMI_SCREEN))
-        print('*** 명령: hmi %s hmi.py dose 20  |  hmi %s hmi.py sis reset' % (VENV_PYTHON, VENV_PYTHON))
+        if USE_AI_AGENT:
+            print('*** AI 에이전트가 주입률을 자동 제어 중 (logs/ai_agent.log)')
+            print('*** 수동 개입: hmi %s hmi.py dose 20  |  SIS: hmi %s hmi.py sis reset' % (VENV_PYTHON, VENV_PYTHON))
+        else:
+            print('*** 명령: hmi %s hmi.py dose 20  |  hmi %s hmi.py sis reset' % (VENV_PYTHON, VENV_PYTHON))
         CLI(network)
     finally:
         stop(network)
