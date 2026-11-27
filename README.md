@@ -113,14 +113,68 @@ sudo python3 tests/verify_system.py                  # 전체. 약 9분
 
 셋 다 끝에 `RESULT=PASS`가 찍히면 통과입니다. 2026-11-19 마지막 실행에서 셋 모두 통과했습니다. 전체 검증은 14개 항목, 제어 판정은 22개입니다. 이 결과는 codex와 Claude 검토자의 코드 검토 지적을 반영한 뒤의 것입니다. 측정값은 설계 문서 10절에 있습니다.
 
-## 다음 단계
+## AI 에이전트 (스마트 정수장)
 
-모델 학습 데이터를 이 시뮬레이션으로 만드는 방법은 `outputs/261124-코드정리.html`의 9절에 설계안으로 적었습니다(아직 구현하지 않음).
+물리·제어 계층 위에 AI 추론 계층을 붙였습니다. 원수 탁도를 보고 약품 주입률 설정값을 자동으로 예측해 PLC2에 전달합니다.
+
+### 추가된 파일
+
+| 파일 | 역할 |
+|---|---|
+| `water_cps/scenarios.py` | 원수 조건 생성 (평상시·호우·조류·고탁도) |
+| `water_cps/operator_policy.py` | 운영자 자-테스트 정책 시뮬레이션 |
+| `water_cps/dataset/build_dataset.py` | 학습 데이터 CSV 생성 |
+| `water_cps/dataset/train_model.py` | scikit-learn 2단계 모델 학습 |
+| `water_cps/ai_agent.py` | AI 추론 → PLC2 자동 제어 |
+
+### 모델 구조
+
+1단계: 원수 탁도 → 수질 유형 분류 (RandomForest)  
+2단계: 유형별 주입률 회귀 예측 (normal→Ridge, storm·algae→RandomForest)
+
+입력 특성: 탁도, log(탁도), 조류 보정값  
+학습 데이터: 30일치 시뮬레이션 86,400걸음
+
+### 보안 조치
+
+- **F1 출력 범위 검사**: 예측값이 5~50 mg/L 범위를 벗어나면 클리핑하거나 안전 기본값 사용
+- **H2 입력 이상 탐지**: 한 걸음에 탁도가 100 NTU 이상 급변하면 센서 위변조 경보
+
+### 학습 데이터 생성 및 모델 학습
+
+생성된 CSV와 pkl 파일은 gitignore 처리돼 있습니다. 아래 명령으로 재생성합니다.
+
+```bash
+cd water_cps
+pip install scikit-learn
+python3 dataset/build_dataset.py        # dataset/train.csv 생성 (~1분)
+python3 dataset/train_model.py          # dataset/models/*.pkl 생성
+```
+
+### AI 에이전트 실행
+
+`run.py`의 `USE_AI_AGENT = True`(기본값)로 설정된 상태에서 평소처럼 실행하면 HMI 대신 AI 에이전트가 뜹니다.
+
+```bash
+sudo python3 run.py
+```
+
+AI 에이전트 로그는 `logs/ai_agent.log`에 남습니다. 수동으로 개입하고 싶으면 Mininet 명령창에서:
+
+```
+mininet> hmi venv/bin/python hmi.py dose 20
+```
+
+AI 에이전트만 단독으로 테스트하려면:
+
+```bash
+venv/bin/python ai_agent.py status      # 현재 탁도 읽어서 예측값 한 번 출력
+```
 
 ## 일부러 남긴 한계
 
 설계 문서 11-2절에 자세히 적었습니다.
 
-- PLC2는 받은 설정값을 검사하지 않습니다. 마지막 한계(5~50 mg/L)는 스마트 정수장 단계에서 PLC2에 넣습니다.
+- PLC2는 받은 설정값을 검사하지 않습니다. 범위 검사(5~50 mg/L)는 AI 에이전트(`ai_agent.py`) 쪽에서 수행합니다(F1 보안 조치).
 - 장치 프로그램이 죽어도 알리지 않습니다. 알아채는 일은 감시 층의 몫입니다.
 - 통신에 인증이 없습니다(EtherNet/IP와 MiniCPS의 한계). 구역·방화벽 단계에서 출발지 주소로 제한합니다.
