@@ -171,11 +171,14 @@ def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
     print("4. 운영자와 비교 (검증 데이터, 참 필요 주입률 대비)")
     print("=" * 50)
     # 분류기가 고른 유형의 모델로 예측한다. 실제로 쓸 때와 같은 경로다.
-    model_pred = []
-    for row_s, label in zip(X_val_s, type_pred):
-        label = str(label)
-        model_pred.append(float(regressors[label].predict([row_s])[0]) if label in regressors
-                          else float('nan'))
+    # 유형별로 묶어 한 번에 예측한다. 한 줄씩 부르면 매번 스레드를 띄워 VM에서 수십 분 걸린다
+    model_pred = [float('nan')] * len(type_pred)
+    for label in set(str(t) for t in type_pred):
+        if label not in regressors:
+            continue
+        rows = [k for k, t in enumerate(type_pred) if str(t) == label]
+        for k, p in zip(rows, regressors[label].predict(_pick(X_val_s, rows))):
+            model_pred[k] = float(p)
     required_val = _pick(y_required, idx_val)
     operator_val = _pick(y_operator, idx_val)
     ok = [k for k, p in enumerate(model_pred) if not math.isnan(p)]
