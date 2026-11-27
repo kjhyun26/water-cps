@@ -40,8 +40,8 @@ class WaterTopology(Topo):
 def clean_up_processes():
     subprocess.run(['pkill', '-f', 'cpppo.server.enip'])
     subprocess.run(['pkill', '-f', 'plc[123].py|sis.py|physical_process.py|hmi.py|ai_agent.py|scenario_feeder.py'])
-    # 지난 실행이 남긴 AI 멈춤 표시와 조류 센서 값을 지운다
-    for path in ('logs/ai_agent.pause', 'logs/algae_sensor.txt'):
+    # 지난 실행이 남긴 AI 멈춤 표시와 자-테스트 값을 지운다
+    for path in ('logs/ai_agent.pause', 'logs/jar_test.json'):
         if os.path.exists(path):
             os.remove(path)
 
@@ -113,6 +113,7 @@ def main():
             print('*** AI 에이전트가 주입률을 자동 제어 중 (logs/ai_agent.log)')
             print('*** 수동 개입: hmi %s ai_agent.py pause  뒤에  hmi %s hmi.py dose 20' % (VENV_PYTHON, VENV_PYTHON))
             print('***           AI 복귀: hmi %s ai_agent.py resume  |  SIS: hmi %s hmi.py sis reset' % (VENV_PYTHON, VENV_PYTHON))
+            print('*** 자-테스트 입력: hmi %s ai_agent.py jartest 20.5  |  예측값 패킷: logs/ai_predictions.jsonl' % VENV_PYTHON)
         else:
             print('*** 명령: hmi %s hmi.py dose 20  |  hmi %s hmi.py sis reset' % (VENV_PYTHON, VENV_PYTHON))
         if FEED_SCENARIO:

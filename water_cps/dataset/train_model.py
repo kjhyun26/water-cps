@@ -8,7 +8,11 @@
 운영자 설정값은 하루 한 번만 바뀌어서 지금 탁도와 맞지 않는 때가 많다. 그것을 따라 배우면
 모델도 늦게 반응하는 운영자를 흉내 낼 뿐이다.
 
-입력 특성: 측정 탁도, log(측정 탁도), 탁도 변화율(1시간), 조류 보정값 (ai_model.features)
+입력 특성: 측정 탁도, log(측정 탁도), 탁도 변화율(1시간) (ai_model.features)
+
+조류 기간은 학습에서 뺀다. 조류는 탁도를 바꾸지 않아 센서값이 평상시와 같은데 필요량만
+5 mg/L 많다. 같은 입력에 다른 정답이 섞이면 평상시 예측만 흐려진다. 팀 설계대로 조류는
+AI가 알 수 없는 변화로 두고, evaluate_policy.py 에서 한계로 확인한다.
 입력: dataset/train.csv (build_dataset.py 로 생성)
 출력: dataset/models/
   - scaler.pkl         입력 정규화 (분류기·회귀 공용)
@@ -16,6 +20,8 @@
   - model_<유형>.pkl   유형별 회귀 모델 (데이터가 있는 유형만)
   - guard.json         AI1 학습 범위, AI2 불확실성 기준 (ai_model.make_guard)
   - metrics.json       평가 지표
+  - model_info.json    모델 버전과 sha256 (예측값 패킷에 붙임)
+그리고 dataset/baseline_table.json (기준값 조견표, baseline.py. AI 출력과 무관)
 
 검증 분할: 유형 비율을 지켜 무작위로 20%를 떼어 둔다(stratified). 시간 순서로 뒤쪽을 떼면
 뒤쪽 6일이 평상시뿐이라 호우·조류 모델을 검증할 수 없다. 이 모델은 시간 정보를 입력으로
@@ -63,19 +69,22 @@ RANDOM_SEED = 42
 def load_data(path: str):
     """CSV → (X, y_target, y_type, y_required, y_operator)."""
     X, y_target, y_type, y_required, y_operator = [], [], [], [], []
+    skipped_algae = 0
     with open(path) as f:
         for i, row in enumerate(csv.DictReader(f)):
             if i < WARMUP_STEPS:
                 continue
+            if row['water_type'] == 'algae':
+                skipped_algae += 1
+                continue
             # 모델은 탁도계가 읽은 값(측정 오차 포함)만 본다. 참값은 평가에만 쓴다
             X.append(ai_model.features(float(row['measured_turbidity_ntu']),
-                                       float(row['turbidity_trend']),
-                                       float(row['algae_extra_mg_per_l'])))
+                                       float(row['turbidity_trend'])))
             y_target.append(float(row['jar_test_dose_mg_per_l']))
             y_type.append(row['water_type'])
             y_required.append(float(row['required_dose_mg_per_l']))
             y_operator.append(float(row['dose_setpoint_mg_per_l']))
-    print(f"로드: {len(X):,}행 (워밍업 {WARMUP_STEPS}걸음 제외)")
+    print(f"로드: {len(X):,}행 (워밍업 {WARMUP_STEPS}걸음, 조류 기간 {skipped_algae:,}걸음 제외)")
     print("유형별: " + ', '.join(f"{k} {v:,}" for k, v in sorted(Counter(y_type).items())))
     return X, y_target, y_type, y_required, y_operator
 
@@ -219,15 +228,28 @@ def train(csv_path: str = TRAIN_CSV, model_dir: str = MODEL_DIR):
     with open(os.path.join(model_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     print(f"  저장: {os.path.join(model_dir, 'metrics.json')}")
+
+    # 모델 버전과 해시 (예측값 패킷에 붙인다. 승인 목록 대조는 보안 설계 쪽 H5)
+    import datetime
+    info = {'model_version': 'v' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S'),
+            'model_hash': ai_model.model_hash(model_dir)}
+    with open(os.path.join(model_dir, ai_model.MODEL_INFO_FILE), 'w') as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+    print(f"  저장: {os.path.join(model_dir, ai_model.MODEL_INFO_FILE)} "
+          f"({info['model_version']}, sha256 {info['model_hash'][:12]}…)")
+
+    # 기준값 조견표 (AI 출력과 무관하게 기록만으로 만든다)
+    import baseline
+    baseline.build(csv_path)
+    print(f"  저장: {baseline.TABLE_FILE} (기준값 조견표, AI 출력 사용 안 함)")
     return metrics
 
 
-def predict(raw_turbidity_ntu: float, trend: float = 0.0, algae_extra: float = 0.0,
-            model_dir: str = MODEL_DIR) -> dict:
+def predict(raw_turbidity_ntu: float, trend: float = 0.0, model_dir: str = MODEL_DIR) -> dict:
     """저장된 모델과 AI1·AI2 로 판단한다. 테스트용."""
     scaler, clf, regressors = ai_model.load_models(model_dir)
     guard = ai_model.load_guard(model_dir)
-    r = ai_model.assess(ai_model.features(raw_turbidity_ntu, trend, algae_extra),
+    r = ai_model.assess(ai_model.features(raw_turbidity_ntu, trend),
                         scaler, clf, regressors, guard)
     required = r['required']
     return {'water_type': r['water_type'], 'confidence': round(r['confidence'], 2),
@@ -241,12 +263,13 @@ if __name__ == '__main__':
     print("\n" + "=" * 50)
     print("6. 추론 샘플 테스트")
     print("=" * 50)
-    for ntu, trend, algae, desc in [(6.0, 0.0, 0.0, '평상시'), (50.0, 1.3, 0.0, '호우 오름'),
-                                    (300.0, 0.0, 0.0, '호우 정점'), (80.0, 0.0, 0.0, '고탁도 머묾'),
-                                    (6.0, 0.0, 5.0, '조류'),
-                                    (900.0, 0.0, 0.0, '처음 보는 탁도 (AI1)'),
-                                    (6.0, 3.0, 0.0, '처음 보는 변화율 (AI1)'),
-                                    (80.0, 0.3, 0.0, '호우·고탁도 애매 (AI2)')]:
-        r = predict(ntu, trend, algae)
-        print(f"  {desc} (탁도={ntu}, 변화율={trend}, 조류={algae}) → 유형={r['water_type']}"
+    for ntu, trend, desc in [(6.0, 0.0, '평상시'), (50.0, 1.3, '호우 오름'),
+                             (300.0, 0.0, '호우 정점'), (80.0, 0.0, '고탁도 머묾'),
+                             (900.0, 0.0, '처음 보는 탁도 (AI1)'),
+                             (6.0, 3.0, '처음 보는 변화율 (AI1)'),
+                             (80.0, 0.3, '호우·고탁도 애매 (AI2)')]:
+        r = predict(ntu, trend)
+        print(f"  {desc} (탁도={ntu}, 변화율={trend}) → 유형={r['water_type']}"
               f"({r['confidence']}), 설정값={r['setpoint_mg_per_l']} mg/L {r['flags'] or ''}")
+    print("  조류 기간은 센서값이 평상시와 같아 평상시와 같은 값(약 17.2 mg/L)이 나온다. "
+          "실제 필요량은 약 20.2+2 mg/L (한계)")

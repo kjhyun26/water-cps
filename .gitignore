@@ -13,9 +13,11 @@ logs/
 
 # 생성된 학습 데이터 (build_dataset.py 로 재생성 가능)
 water_cps/dataset/*.csv
+water_cps/dataset/baseline_table.json
 
 # 학습된 모델 (train_model.py 로 재생성 가능)
 water_cps/dataset/models/*.pkl
 water_cps/dataset/models/metrics.json
 water_cps/dataset/models/guard.json
+water_cps/dataset/models/model_info.json
 .DS_Store

@@ -32,7 +32,7 @@ class OperatorPolicy:
         self.emergency_threshold_ntu = emergency_threshold_ntu
         self.emergency_overdose = emergency_overdose
         self.setpoint = INITIAL_DOSE_SETPOINT
-        self._last_jar_test_hour = -1  # 같은 시간에 두 번 갱신 방지
+        self._last_jar_test = None  # (날짜, 시각). 같은 날 같은 시각에 두 번 갱신 방지
 
     def setpoint_at(
         self,
@@ -53,24 +53,24 @@ class OperatorPolicy:
             주입률 설정값 (mg/L).
         """
         hour_of_day = int(sim_time_seconds // 3600) % 24
+        day = int(sim_time_seconds // 86400)
 
         # 비상: 탁도가 임계값을 넘으면 즉시 올린다
         if raw_turbidity_ntu >= self.emergency_threshold_ntu:
             self.setpoint = true_required_dose + self.emergency_overdose
-            self._last_jar_test_hour = -1  # 비상 해제 후 자-테스트 재개
             return round(self.setpoint, 4)
 
-        # 정시 자-테스트 (한 시간에 한 번만)
-        if hour_of_day in self.jar_test_hours and hour_of_day != self._last_jar_test_hour:
+        # 정시 자-테스트 (날마다 정한 시각에 한 번씩)
+        if hour_of_day in self.jar_test_hours and (day, hour_of_day) != self._last_jar_test:
             self.setpoint = true_required_dose + self.overdose
-            self._last_jar_test_hour = hour_of_day
+            self._last_jar_test = (day, hour_of_day)
 
         return round(self.setpoint, 4)
 
     def reset(self):
         """시나리오 재실행 시 상태 초기화."""
         self.setpoint = INITIAL_DOSE_SETPOINT
-        self._last_jar_test_hour = -1
+        self._last_jar_test = None
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,10 @@ def _self_check():
     # 비상 (탁도 300 NTU)
     dose_emergency = policy.setpoint_at(10 * 3600, required_dose(300.0), 300.0)
     assert dose_emergency > required_dose(300.0), "emergency dose should exceed required"
+
+    # 다음 날 9시에도 자-테스트를 한다
+    dose_next_day = policy.setpoint_at(86400 + 9 * 3600, required_dose(6.0) + 5.0, 6.0)
+    assert abs(dose_next_day - (required_dose(6.0) + 7.0)) < 0.01, "should jar-test again next day"
 
     print("operator_policy.py OK")
 

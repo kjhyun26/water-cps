@@ -6,7 +6,14 @@ minicps를 import하지 않는다. 그래서 MiniCPS 없이도 불러 쓸 수 �
 모델 (2단계, 도메인 문서 4-5절):
   1단계 — 유형 분류: 입력 특성 → water_type (RandomForest 분류기)
   2단계 — 유형별 회귀: 입력 특성 → 자-테스트 필요 주입률 (유형마다 별도 모델)
-설정값 = 예측한 필요 주입률 + SAFETY_MARGIN (운영자가 자-테스트 값에 여유를 얹는 것과 같다)
+추천 주입률 = 기본 추천 − 여유 조정 + 자-테스트 보정   (팀 설계 발표 29장, 중간발표 12쪽)
+  기본 추천    예측한 필요 주입률 + 운영자 여유(SAFETY_MARGIN). 운영자가 자-테스트 값에 여유를
+               얹어 넣는 결정을 5분마다 내는 것
+  여유 조정    5시간 뒤 결과로 배워 여유를 줄이는 양. 평소 조건에서만 줄이고 호우·처음 보는
+               조건에서는 0. 설계상 운전하며 다시 배우는 "추가 학습"에서 0.5씩 넓히므로
+               처음 학습인 지금은 0 (MARGIN_REDUCTION)
+  자-테스트 보정  하루 한 번 사람이 한 실험값 − 그때 모델의 예측. 센서에 안 보이는 변화
+               (조류 등)를 다음 실험 때까지 메운다
 
 AI 보안 조치 (AI 자신의 약점을 다룬다. 팀 위협 H1~H5·F1과 겹치지 않는다):
   AI1 처음 보는 입력 감지 — 입력 특성이 학습 데이터 범위(조금 넓힌 범위) 밖이면 모델이 모르는
@@ -32,15 +39,40 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset', 
 # 모자라게 넣으면 침전수 탁도가 가파르게 오르고 넘치면 완만하게 오르기 때문에 (설계 문서 4절)
 # 약간 넘치게 넣는 편이 안전하다.
 SAFETY_MARGIN = 2.0
+# 여유 조정 (추가 학습에서 0.5씩 넓힌다. 처음 학습 단계는 0)
+MARGIN_REDUCTION = 0.0
+# 자-테스트 보정 한도 (mg/L). 실험 한 번이 크게 틀려도 추천이 터무니없이 움직이지 않게
+JAR_CORRECTION_MIN = -2.0
+JAR_CORRECTION_MAX = 10.0
+MODEL_INFO_FILE = 'model_info.json'
+
+
+def jar_correction(jar_test_dose, predicted_required):
+    """자-테스트 보정 = 실험값 − 그때 모델의 예측 필요 주입률 (한도 안으로 자름)."""
+    return min(max(jar_test_dose - predicted_required, JAR_CORRECTION_MIN), JAR_CORRECTION_MAX)
+
+
+def recommend(result, correction=0.0):
+    """assess 결과로 추천 주입률과 세 부분을 낸다. required 가 None 이면 None."""
+    if result['required'] is None:
+        return None, {}
+    base = result['required'] + SAFETY_MARGIN
+    # 여유 조정은 평소 조건(평상시 유형, 보안 조치가 걸리지 않음)에서만
+    calm = result['water_type'] == 'normal' and not result['flags']
+    reduction = MARGIN_REDUCTION if calm else 0.0
+    setpoint = base - reduction + correction
+    return setpoint, {'base': round(base, 3), 'margin_reduction': reduction,
+                      'jar_correction': round(correction, 3)}
 
 
 # 탁도 변화율을 보는 창 (공정 초). 호우는 이 창 안에서 크게 오르내리고 고탁도는 천천히 움직인다.
 TREND_WINDOW_SECONDS = 3600
 
 
-def features(raw_turbidity_ntu: float, turbidity_trend: float, algae_extra: float) -> list:
-    """입력 특성: 탁도, log(탁도), 탁도 변화율(1시간 log 비), 조류 보정값."""
-    return [raw_turbidity_ntu, math.log(max(raw_turbidity_ntu, 0.1)), turbidity_trend, algae_extra]
+def features(raw_turbidity_ntu: float, turbidity_trend: float) -> list:
+    """입력 특성: 탁도, log(탁도), 탁도 변화율(1시간 log 비).
+    조류는 넣지 않는다. 팀 설계대로 조류는 센서에 직접 보이지 않는 변화로 둔다."""
+    return [raw_turbidity_ntu, math.log(max(raw_turbidity_ntu, 0.1)), turbidity_trend]
 
 
 class TurbidityTrend:
@@ -62,9 +94,9 @@ class TurbidityTrend:
 
 
 GUARD_FILE = 'guard.json'
-FEATURE_NAMES = ['turbidity', 'log_turbidity', 'turbidity_trend', 'algae_extra']
+FEATURE_NAMES = ['turbidity', 'log_turbidity', 'turbidity_trend']
 # AI1 범위를 학습 데이터 최솟값·최댓값에서 얼마나 넓힐지
-OOD_RATIO_MARGIN = 1.2      # 탁도·조류: 최댓값 × 1.2, 최솟값 ÷ 1.2
+OOD_RATIO_MARGIN = 1.2      # 탁도: 최댓값 × 1.2, 최솟값 ÷ 1.2
 OOD_TREND_MARGIN = 0.2      # 변화율: ± 0.2
 # AI2 기준
 TYPE_CONFIDENCE_MIN = 0.8   # 분류기의 가장 높은 확률이 이보다 낮으면 유형을 확신하지 못한 것
@@ -76,9 +108,9 @@ def make_guard(X_train, tree_spreads):
     lows = [min(col) for col in zip(*X_train)]
     highs = [max(col) for col in zip(*X_train)]
     low = [lows[0] / OOD_RATIO_MARGIN, math.log(max(lows[0] / OOD_RATIO_MARGIN, 0.1)),
-           lows[2] - OOD_TREND_MARGIN, 0.0]
+           lows[2] - OOD_TREND_MARGIN]
     high = [highs[0] * OOD_RATIO_MARGIN, math.log(highs[0] * OOD_RATIO_MARGIN),
-            highs[2] + OOD_TREND_MARGIN, max(highs[3] * OOD_RATIO_MARGIN, 0.0)]
+            highs[2] + OOD_TREND_MARGIN]
     spreads = sorted(tree_spreads)
     # 학습 데이터에서 나온 편차의 99.9 백분위수보다 20% 크면 평소와 다르게 갈린 것으로 본다
     spread_limit = spreads[int(len(spreads) * 0.999)] * 1.2 if spreads else float('inf')
@@ -165,6 +197,30 @@ def assess(row, scaler, clf, regressors, guard):
     return assess_batch([row], scaler, clf, regressors, guard)[0]
 
 
+MODEL_FILES_GLOB = ('scaler.pkl', 'classifier.pkl', 'model_*.pkl', GUARD_FILE)
+
+
+def model_hash(model_dir: str = MODEL_DIR):
+    """모델 파일 전체의 sha256. 예측값 패킷의 model_hash (팀 설계 H5: 승인 목록 대조용)."""
+    import glob
+    import hashlib
+    digest = hashlib.sha256()
+    paths = sorted({p for pattern in MODEL_FILES_GLOB for p in glob.glob(os.path.join(model_dir, pattern))})
+    for path in paths:
+        digest.update(os.path.basename(path).encode())
+        with open(path, 'rb') as f:
+            digest.update(f.read())
+    return digest.hexdigest()
+
+
+def load_model_info(model_dir: str = MODEL_DIR):
+    try:
+        with open(os.path.join(model_dir, MODEL_INFO_FILE)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {'model_version': 'unknown'}
+
+
 def load_guard(model_dir: str = MODEL_DIR):
     with open(os.path.join(model_dir, GUARD_FILE)) as f:
         return json.load(f)
@@ -190,10 +246,9 @@ def load_models(model_dir: str = MODEL_DIR):
     return scaler, clf, regressors
 
 
-def predict_required(raw_turbidity_ntu: float, turbidity_trend: float, algae_extra: float,
-                     scaler, clf, regressors):
+def predict_required(raw_turbidity_ntu: float, turbidity_trend: float, scaler, clf, regressors):
     """AI1·AI2 없이 모델만 쓴 예측 (비교용). (예측 필요 주입률 또는 None, 유형 레이블)."""
-    x = scaler.transform([features(raw_turbidity_ntu, turbidity_trend, algae_extra)])
+    x = scaler.transform([features(raw_turbidity_ntu, turbidity_trend)])
     water_type = str(clf.predict(x)[0])
     if water_type not in regressors:
         return None, water_type
