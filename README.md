@@ -6,7 +6,7 @@
 - 제어 계층: 센서를 읽고 펌프와 밸브를 움직이는 PLC 세 대와 SIS(PLC와 따로 두는 안전 장치).
 - HMI: 값을 보여 주고 설정값을 넣는 최소한의 화면.
 
-AI 주입률 예측은 아래 "AI 에이전트" 절에 있습니다. 게이트웨이, 구역·방화벽 같은 나머지 "스마트 정수장" 부분은 다음 단계이고, 여기에는 없습니다.
+AI 주입률 예측은 아래 "AI 에이전트" 절에, 게이트웨이·방화벽·PLC2 보호는 "보안 조치" 절에 있습니다. 게이트웨이는 단순 버전이라 설계의 구역 분리(감시 구역, 운전 기록 서버·복제본·중계 서버)는 만들지 않았습니다.
 
 ## 무엇이 무엇을 하나
 
@@ -41,11 +41,15 @@ AI 주입률 예측은 아래 "AI 에이전트" 절에 있습니다. 게이트�
    ├─ run.py               Mininet 가상 네트워크 구성과 장치 실행
    ├─ scenarios.py  operator_policy.py  scenario_feeder.py   원수 시나리오와 운영자 흉내
    ├─ ai_model.py  ai_agent.py  baseline.py                  AI 추론, 에이전트, 기준값
+   ├─ gateway.py           AI 예측값 검사 후 PLC2에 쓰는 게이트웨이 (아래 "보안 조치" 절)
    ├─ dataset/             학습 데이터 생성, 학습, 평가 (아래 "AI 에이전트" 절)
    └─ tests/
       ├─ verify_physical_process.py  공정만 1,500걸음 대본 검증
       ├─ verify_control_logic.py     SIS·PLC3 판정에 센서값을 순서대로 넣어 봄
-      └─ verify_system.py            전체를 띄우고 확인 1~6 자동 실행
+      ├─ verify_system.py            전체를 띄우고 확인 1~6 자동 실행
+      ├─ test_gateway_offline.py  test_plc2_offline.py   게이트웨이·PLC2 보호 판정 (가짜 통신)
+      ├─ check_firewall.py           방화벽 접속 행렬
+      └─ verify_security.py          공격 시나리오를 보안 끔/켬으로 비교
 ```
 
 ## 필요한 환경
@@ -62,7 +66,7 @@ cpppo는 5.2.5를 씁니다. MiniCPS가 고정해 둔 4.3.4는 Python 3.12에서
 ## 설치
 
 ```bash
-sudo apt install -y mininet openvswitch-switch sqlite3 git
+sudo apt install -y mininet openvswitch-switch sqlite3 git iptables    # iptables 는 보안 조치용 (WSL 기본 설치에 없음)
 sudo service openvswitch-switch start
 sudo mn --switch ovsbr --controller none --test pingall    # 0% dropped 이면 통과
 ```
@@ -80,7 +84,7 @@ venv/bin/python -c "import minicps.devices; print('ok')"
 
 ```bash
 cd ~/water_cps
-sudo python3 run.py                         # 가상 네트워크와 장치 다섯을 띄우고 Mininet 명령창을 연다
+sudo python3 run.py                         # 가상 네트워크와 호스트 일곱(plc1~3, sis, hmi, ai, attacker)을 띄우고 Mininet 명령창을 연다
 ```
 
 ```bash
@@ -175,7 +179,7 @@ sudo python3 tests/verify_system.py                  # 전체. 약 9분
 - `seq`는 재시작해도 줄지 않게 시작 시각(ms)에서 늘립니다.
 - `model_hash`는 모델 파일 전체의 sha256입니다(`train_model.py`가 `dataset/models/model_info.json`에도 기록).
 - 시각·순번·승인 모델·입력 원본 검사는 게이트웨이(보안 설계 담당)가 합니다.
-- 팀 설계는 "AI는 PLC에 바로 쓰지 못한다"입니다. 게이트웨이가 생기기 전까지 `ai_agent.py`의 `DIRECT_WRITE = True`로 임시로 PLC2에 직접 씁니다. 게이트웨이가 붙으면 `False`로 바꿉니다.
+- 팀 설계는 "AI는 PLC에 바로 쓰지 못한다"입니다. `ai_agent.py`의 `DIRECT_WRITE = False`라 AI는 패킷만 쓰고, PLC2에는 게이트웨이(`gateway.py`)가 검사를 통과한 값만 씁니다(아래 "보안 조치").
 
 ### 결과 (2026-11-27)
 
@@ -223,7 +227,8 @@ venv/bin/python dataset/evaluate_policy.py     # 운영자·기준값·AI 비교
 
 | 설정 | 기본값 | 뜻 |
 |---|---|---|
-| `USE_AI_AGENT` | True | hmi 노드에서 화면(hmi.py)과 함께 AI 에이전트를 띄움 |
+| `USE_AI_AGENT` | True | ai 노드(192.168.1.60)에서 AI 에이전트를 띄움. 패킷만 내고 PLC2에는 게이트웨이가 씀 |
+| `USE_SECURITY` | True | iptables, 게이트웨이 검사, PLC2 보호를 함께 켬. False 이면 셋 다 끔(게이트웨이는 검사 없이 그대로 전달). 아래 "보안 조치" |
 | `FEED_SCENARIO` | True | 원수 공급기를 띄워 원수 탁도와 매일 9시 자-테스트 값을 흘려 넣음 |
 | `FEED_START_HOURS` | 119.5 | 시나리오 시작 시각. 119.5면 5일차 호우 30분 전이라 실제 30초 뒤 호우가 옴. 215.5면 9일차 고탁도, 431.5면 18일차 조류 |
 
@@ -234,20 +239,21 @@ sudo python3 run.py
 
 ```bash
 tail -f ~/water_cps/logs/ai_agent.log            # 다른 터미널: AI 판단
+tail -f ~/water_cps/logs/gateway.log             # 다른 터미널: 게이트웨이 판정 (JSON 한 줄씩)
 watch -n 1 cat ~/water_cps/logs/hmi_screen.txt   # 다른 터미널: HMI 화면
 ```
 
 Mininet 명령창에서 넣는 명령:
 
 ```
-mininet> hmi venv/bin/python ai_agent.py status        지금 탁도로 AI 추천값 한 번 보기
-mininet> hmi venv/bin/python ai_agent.py jartest 20.5  운영자가 자-테스트 결과 입력
-mininet> hmi venv/bin/python ai_agent.py pause         AI의 PLC2 쓰기 멈춤
-mininet> hmi venv/bin/python hmi.py dose 20            (멈춘 뒤) 운영자가 직접 설정
-mininet> hmi venv/bin/python ai_agent.py resume        AI의 PLC2 쓰기 다시 시작
+mininet> ai venv/bin/python ai_agent.py status         지금 탁도로 AI 추천값 한 번 보기
+mininet> ai venv/bin/python ai_agent.py jartest 20.5   운영자가 자-테스트 결과 입력
+mininet> hmi venv/bin/python gateway.py resume         게이트웨이 폴백 → AI 모드 복귀 (운영자 승인)
 ```
 
-AI를 멈추지 않고 `hmi.py dose`를 넣으면 1초 안에 AI가 자기 값으로 덮어씁니다.
+- 보안을 켜면 ai 노드는 PLC2에 닿지 못해 `status`의 "PLC2 현재 설정값"이 nan 으로 나옵니다(설계대로).
+- `ai_agent.py pause`/`resume`은 AI가 PLC2에 직접 쓸 때(`DIRECT_WRITE = True`)만 뜻이 있는 명령이라 지금은 효과가 없습니다. 패킷은 계속 나갑니다.
+- `hmi.py dose`로 넣은 값은 게이트웨이가 다음 통과 패킷(공정 5분 안, 실제 약 5초)에서 덮어쓰고, 폴백 중에는 매 주기 기준값으로 덮어씁니다. 지금은 운영자 수동 모드가 없습니다. 직접 정하려면 `USE_AI_AGENT`와 `USE_SECURITY`를 둘 다 끄고 띄웁니다.
 
 `tests/verify_system.py`는 AI와 원수 공급기 없이 기존 구성을 시험합니다(`start_devices`의 기본값).
 
@@ -255,7 +261,7 @@ AI를 멈추지 않고 `hmi.py dose`를 넣으면 1초 안에 AI가 자기 값�
 
 - 입력 센서: 설계는 원수 탁도·pH·수온·전기전도도인데, 공정이 원수 탁도만 만들어 탁도와 변화율만 씁니다. 조류 유형 분류도 그래서 없습니다.
 - 읽는 곳: 설계는 감시 구역의 기록 복제본에서 읽는데, 구역이 아직 없어 PLC1에서 직접 읽습니다. 구역이 생기면 읽는 주소만 바꿉니다.
-- 쓰는 곳: 위 "예측값 패킷"처럼 게이트웨이 전까지 PLC2에 임시로 직접 씁니다.
+- 쓰는 곳: 설계대로 AI는 PLC2에 쓰지 않고 게이트웨이를 거칩니다. 설계의 중계 서버 대신 예측값 파일(`logs/ai_predictions.jsonl`)을 씁니다.
 - 여유 조정(추가 학습)과 14일 재학습·섀도 운전은 구현하지 않았습니다.
 - 학습 데이터는 MiniCPS 운전 기록이 아니라 같은 공정 수식을 빠르게 돌려 만듭니다.
 - 소독·착수정 모델은 없습니다(이 단계 범위는 약품 주입 한 구간).
@@ -270,10 +276,76 @@ AI를 멈추지 않고 `hmi.py dose`를 넣으면 1초 안에 AI가 자기 값�
 - AI1에서 탁도가 학습 범위를 크게 넘으면 예측이 범위 끝 값에 머뭅니다. 약 800 NTU를 넘으면 여유 2 mg/L가 줄어들기 시작하므로 운영자 확인이 필요합니다(그래서 경보를 냅니다).
 - 이 시뮬레이션에서 나무 편차는 대부분 자-테스트 측정 오차를 반영해, AI2 나무 편차 검사는 거의 걸리지 않습니다.
 
+## 보안 조치
+
+팀 보안 설계(중간발표 22·28쪽)와 AI 파트의 「게이트웨이 구현 안내」를 따라 약품 주입 구간에 세 겹의 보호를 붙였습니다. 결정 사항과 시험 기준의 자세한 내용은 `CLAUDE.md`에 있습니다.
+
+### 구성
+
+`run.py`의 `USE_SECURITY` 하나로 셋을 함께 켜고 끕니다. 끄면 보호가 없는 비교용 구성이 됩니다(게이트웨이는 검사 없이 그대로 전달, 방화벽 없음, PLC2 검사 없음). `start_devices`의 기본값은 끔이라 `verify_system.py`는 예전 구성을 시험합니다.
+
+| 호스트 | IP | 띄우는 것 |
+|---|---|---|
+| plc1, plc2, plc3, sis | 192.168.1.10~40 | 제어 장치 |
+| hmi | 192.168.1.50 | 화면(hmi.py), 게이트웨이(gateway.py) |
+| ai | 192.168.1.60 | AI 에이전트. 패킷만 쓰고 PLC2에는 쓰지 않음 |
+| attacker | 192.168.1.70 | 공격 시험용. 아무것도 띄우지 않음 |
+
+**방화벽**(장치마다 iptables): `lo`와 이미 연 연결의 응답은 허용하고, EtherNet/IP(44818) 새 연결은 아래 출발지만 받습니다. 걸린 규칙은 `logs/firewall_rules.txt`에 남습니다.
+
+| 서버 | 받는 출발지 |
+|---|---|
+| plc1 | plc2, hmi, ai |
+| plc2, plc3, sis | hmi |
+
+**게이트웨이**(`gateway.py`, hmi 노드): AI 예측값 패킷을 8가지로 검사하고 통과한 값만 PLC2에 씁니다. 판정은 `logs/gateway.log`에 JSON 한 줄씩 남깁니다.
+
+| 검사 | 기준 | 막는 위협 |
+|---|---|---|
+| ① 형식 | 필수 필드, 단위 mg/L | F1 |
+| ② 출처·모델 | 모델 해시가 승인 목록(`dataset/approved_models.json`)에 있음 | H5 |
+| ③ 시각·순번 | 공정 시각 차이 0~15분, seq 증가 | F1, 재전송 |
+| ④ 입력 센서 | AI가 본 탁도와 PLC1 원본 차이 ≤ max(5 NTU, 10%) | H2 |
+| ⑤ 범위 | 8~45 mg/L | F1 |
+| ⑥ 변화량 | PLC2 현재 설정값과 차이 ≤ 5 mg/L | 급변 |
+| ⑦ 기준값 | 기준값보다 3.5 mg/L 넘게 낮으면 거부 | H2, H4 |
+| ⑧ 누적 | 공정 1시간 전 적용값과 차이 ≤ 10 mg/L | H4 |
+
+연속 3번 거부, 통과한 예측이 공정 15분 없음, PLC3 침전수 탁도 경보 중 하나면 기준값(`baseline.py`)으로 폴백해 매 주기 씁니다. 내려가는 길은 자동이고 올라오는 길은 운영자 승인(`resume`)뿐입니다. 게이트웨이를 다시 띄워도 폴백은 풀리지 않습니다.
+
+**PLC2 보호**(`plc2.py --secure`): 설정값이 5~50 mg/L 밖이면 거부하고 직전 값을 태그에 다시 씁니다(게이트웨이를 거치지 않은 쓰기에도 걸림). 실제 주입률은 공정 시각 어느 60초 구간에서도 2 mg/L 넘게 바뀌지 않게 목표값을 따라갑니다. 이 때문에 보안을 켜면 `hmi.py dose 110`으로 SIS를 일으킬 수 없습니다.
+
+### 명령
+
+```bash
+cd ~/water_cps
+venv/bin/python gateway.py approve            # 학습한 모델을 승인 목록에 넣기 (학습한 PC마다 한 번)
+```
+
+승인 목록은 모델 해시가 PC마다 달라 저장소에 넣지 않습니다. 없으면 보안을 켰을 때 모든 패킷이 ②에서 거부되어 곧 폴백합니다. 폴백에서 돌아올 때는 Mininet 명령창에서 `hmi venv/bin/python gateway.py resume`.
+
+### 시험
+
+| 파일 | 권한 | 시간 | 내용 |
+|---|---|---|---|
+| `tests/test_gateway_offline.py` | 없음 | 1초 | 가짜 PLC로 게이트웨이 검사·폴백·복귀 |
+| `tests/test_plc2_offline.py` | 없음 | 1초 | PLC2 범위 거부와 ramp |
+| `tests/check_firewall.py` | sudo | 1분 | 호스트 7대 → 서버 4대 접속 행렬, 방화벽 없이/건 뒤 |
+| `tests/verify_security.py` | sudo | 약 12분 | 공격 시나리오를 보안 끔/켬으로 두 번 돌려 비교 |
+
+`verify_security.py`는 정상 운전, F1(터무니없는 예측), H4(천천히 낮추기), H2(탁도 위조), H5(모델 바꿔치기), H1(attacker 호스트에서 PLC2 쓰기), H3(HMI에서 dose 200), ramp, 폴백(AI 프로세스 종료)을 돌립니다. 끔에서는 공격이 실제로 통해야, 켬에서는 막혀야 통과입니다. 2026-11-29 마지막 실행에서 `verify_security.py` 18/18, `verify_system.py` 14/14 통과했습니다.
+
+### 보안 조치의 한계
+
+- Mininet 호스트는 파일 시스템을 함께 씁니다. 어느 노드든 예측값 파일, 게이트웨이 모드 파일(`logs/gateway_mode.txt`), 승인 목록을 고칠 수 있어 `resume`을 흉내 낼 수 있습니다. 네트워크가 아니라 시뮬레이션 구조의 한계입니다.
+- 방화벽은 출발지 IP로만 막습니다. hmi를 장악하면(H3) PLC2 자체 검사만 남습니다.
+- ⑧은 게이트웨이가 공정 1시간 넘게 돌아야 기록이 생깁니다. 천천히 낮추기(공정 5분마다 −0.3)는 ⑦이 잡습니다.
+- 운영자 수동 모드가 없습니다. AI가 도는 동안 `hmi.py dose`로 넣은 값은 게이트웨이가 덮어씁니다.
+
 ## 일부러 남긴 한계
 
 설계 문서 11-2절에 자세히 적었습니다.
 
-- PLC2는 받은 설정값을 검사하지 않습니다. AI 에이전트(`ai_agent.py`)가 보내는 값은 에이전트 쪽에서 5~50 mg/L로 자르지만(F1), 다른 곳에서 PLC2에 쓰는 값은 여전히 검사하지 않습니다.
+- 보안을 끄면(`USE_SECURITY = False`) PLC2는 받은 설정값을 검사하지 않습니다. 켜면 5~50 mg/L 밖의 값을 거부합니다(위 "보안 조치").
 - 장치 프로그램이 죽어도 알리지 않습니다. 알아채는 일은 감시 층의 몫입니다.
-- 통신에 인증이 없습니다(EtherNet/IP와 MiniCPS의 한계). 구역·방화벽 단계에서 출발지 주소로 제한합니다.
+- 통신에 인증이 없습니다(EtherNet/IP와 MiniCPS의 한계). 보안을 켜면 장치마다 방화벽으로 출발지 주소를 제한합니다(위 "보안 조치").

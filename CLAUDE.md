@@ -1,16 +1,15 @@
-# CLAUDE.md — 보안 조치 구현 (security 브랜치)
+# CLAUDE.md — 정수장 MiniCPS: 보안 조치
 
-정수장 MiniCPS 시뮬레이션(`water_cps/`)에 보안 조치를 붙이는 작업이다. 기준 문서는
-`/mnt/c/2026/2026-2/차세대인프라보안/TeamProject/게이트웨이 구현안내.pdf`(AI 파트 작성)이고,
-`gateway.py`는 그 문서 8장의 뼈대에서 출발했다. 프로젝트 전체 설명은 `README.md`에 있다.
+정수장 MiniCPS 시뮬레이션(`water_cps/`)에 붙인 보안 조치의 범위, 구성, 결정 사항, 시험을 정리한다.
+기준 문서는 AI 파트의 「게이트웨이 구현 안내」 문서이고, `gateway.py`는 그 문서 8장의 뼈대에서 출발했다.
+프로젝트 전체 설명은 `README.md`(사람용 요약, "보안 조치" 절)에 있다. 개인 설정은 각자 `CLAUDE.local.md`(gitignore)에 둔다.
 
-## 작업 방식
+## 공용 규칙
 
-- 단계마다 결과를 보여 주고, 사용자가 확인한 뒤에 다음 단계로 넘어간다.
-- **sudo 가 필요한 명령(Mininet 시험, `apt install`)은 사용자가 다른 창에서 직접 돌린다.** Claude는
-  실행할 명령을 알려 주고, 출력은 `tee logs/<이름>.txt`로 저장하게 한 뒤 그 파일을 읽는다.
-- 기존 `tests/verify_system.py`는 계속 통과해야 한다(확인 4가 `dose 110`으로 SIS를 일으키므로 보안 끔이 기본값이다).
-- `run.py`는 팀 공용 파일이다.
+- 기존 `tests/verify_system.py`는 계속 14/14 통과해야 한다. 확인 4가 `dose 110`으로 SIS를 일으키므로
+  `run.start_devices`의 기본값은 보안 끔이다.
+- `run.py`는 팀 공용 파일이다. 고치기 전에 `git pull`.
+- Mininet 을 띄우는 시험(`check_firewall.py`, `verify_system.py`, `verify_security.py`)과 `run.py`는 sudo 가 필요하다.
 
 ## 범위
 
@@ -60,8 +59,8 @@
 
 - 장치는 자기 IP로 자기 서버에 쓰는데, 이 연결은 `lo`를 거치므로 허용된다.
 - 규칙 하나라도 실패하면 `RuntimeError`(보안을 켰는데 꺼진 상태를 막음). 걸린 규칙은 `logs/firewall_rules.txt`.
-- iptables 는 `sudo apt install -y iptables`로 설치했다(WSL 기본 설치에 없었음).
-- 켬에서는 ai 노드가 PLC2를 못 읽어 `ai_agent.py status`의 PLC2 줄이 비는데, 이것은 설계대로다.
+- iptables 가 필요하다: `sudo apt install -y iptables` (WSL 기본 설치에 없다).
+- 켬에서는 ai 노드가 PLC2를 못 읽어 `ai_agent.py status`의 "PLC2 현재 설정값"이 nan 이다. 설계대로다.
 
 ## 게이트웨이 (`water_cps/gateway.py`)
 
@@ -89,13 +88,12 @@
 - 만들기: `cd water_cps && venv/bin/python gateway.py approve`. 모델 파일 sha256 이 `model_info.json`과 같을 때만 추가한다.
 - 모델 해시가 학습할 때마다 달라 `.gitignore`에 넣었다. 학습한 PC마다 approve 를 돌려야 한다.
   없으면 켬에서 모든 패킷이 ②에서 거부된다.
-- 현재 승인: v20261129-000628 (sha256 f50af23e60c5…).
 
 ## PLC2 보호 (`water_cps/plc2.py --secure`)
 
 - 범위: DOSE_SETPOINT 가 5~50 mg/L 밖이면 거부하고, 마지막으로 받아들인 **목표값**을 태그에 다시 쓴다.
   로그는 `DOSE_REJECT sim_time=… value=… limits=5~50 restored=…`.
-- ramp (사용자 결정 2026-11-29): 실제 주입률(펌프 명령에 쓰는 값)은 **공정 시각 어느 60초 구간에서도 2 mg/L 이하**로
+- ramp (팀 결정 2026-11-29): 실제 주입률(펌프 명령에 쓰는 값)은 **공정 시각 어느 60초 구간에서도 2 mg/L 이하**로
   목표값을 따라간다(평균 2/분이 아님).
   - 방법: 지난 60초 동안 적용한 값들(60초 전에 적용 중이던 값 포함)과 모두 2 이내가 되도록 자른다.
   - 결과: PLC2 주기가 공정 90초면 실제 속도는 2 mg/L / 90초다. 목표를 받기 전 시간은 앞당겨 쓰지 않는다.
@@ -114,13 +112,13 @@
 | `test_plc2_offline.py` | 없음 | 1초 | PLC2 범위 거부·되돌려 쓰기·ramp, 불규칙 주기 60초 구간 성질 시험 (27개) |
 | `check_firewall.py` | sudo | 1분 | 호스트 7대 → 서버 4대 접속 행렬, 방화벽 없이/건 뒤 |
 | `verify_system.py` | sudo | 9분 | 기존 확인 1~6 (보안 끔). 14/14 유지해야 함 |
-| `verify_security.py` | sudo | 약 18분 | 시나리오를 보안 끔/켬 두 번 돌려 비교 |
+| `verify_security.py` | sudo | 약 12분 | 시나리오를 보안 끔/켬 두 번 돌려 비교 |
 
 ```bash
-cd ~/infra-security/water-cps/water_cps
+cd water_cps
 venv/bin/python tests/test_gateway_offline.py
 venv/bin/python tests/test_plc2_offline.py
-# 아래는 사용자가 다른 창에서
+# 아래는 sudo
 sudo python3 tests/check_firewall.py 2>&1 | tee logs/check_firewall.txt
 sudo python3 tests/verify_system.py 2>&1 | tee logs/verify_system_<태그>.txt
 sudo python3 tests/verify_security.py 2>&1 | tee logs/verify_security_run.txt
@@ -150,32 +148,12 @@ sudo python3 tests/verify_security.py --mode on --only H1 H3      # 일부만
 | R | hmi 에서 +10 | 한 번에 점프 ≥9.9 | 목표 도달, 어느 60초 구간도 2 초과 없음 (mark 직전 행부터) |
 | FB | AI 프로세스 종료 | 폴백 없음, 값 그대로 | stale 폴백 → 기준값, ignored, resume 뒤 accept |
 
-참고 값: 6 NTU 기준값 18.18, 60 NTU 기준값 25.75, 6 NTU AI 추천값 17.17.
+참고 값: 6 NTU 기준값 18.18, 60 NTU 기준값 25.75, 6 NTU AI 추천값 17.17 (학습 결과에 따라 조금 다를 수 있다).
 
-## 진행 상황
-
-1~4단계 완료. 4단계 뒤 `verify_system.py` 14/14 PASS
-(그 실행에서 네 장치가 같은 시점에 66초 멈춘 적이 있었다. PC 전체가 멈춘 것으로 보이며 코드 문제는 아니다).
-`check_firewall.py` PASS(불일치 0).
-
-**5단계 완료 (2026-11-29).** 수정 뒤 `verify_security.py` **18/18 PASS**(`logs/verify_security_run2.txt`, 694초),
-`verify_system.py` **14/14 PASS**(`logs/verify_system_step5.txt`, PLC2 주기 평균 1.262초, 최대 1.42초).
-켬 결과: N 거부 0, H2 consecutive_rejects 폴백, R 17.17 → 27.17 공정 390초 최대 계단 2.00 / 60초 구간 위반 없음.
-PLC2 로그의 Traceback 1개는 시작할 때 연결 거부(처음 값 쓰기 재시도)이고 문제 아님.
-`verify_security.py`의 로그 사본은 `.txt`(`logs/verify_security_{off,on}_{gateway,plc2,gateway_console}.txt`, `_process.csv`)로 둔다. `.log`면 `verify_system.py`의 오류 줄 검사에 잡힌다.
-
-첫 실행은 15/18 (FAIL: on N, off H3, off R)이었고 원인과 수정은 아래와 같다.
-
-| 항목 | 원인 | 고친 것 |
-|---|---|---|
-| on N | 게이트웨이가 PLC1을 먼저 읽고 패킷 파일을 나중에 읽었다. 그 사이(실제 약 1초) AI가 더 새 시각으로 쓴 정상 패킷을 ③에서 −60초로 거부했다(약 1/30). | `gateway.cycle()`: 패킷을 먼저 읽고 PLC를 나중에 읽는다. ③ 허용 범위는 그대로다. |
-| off H3 | 공격은 통했다(PLC2 명령 400 kg/h, SIS 차단). 시험이 펌프 최대로 불가능한 실제 주입률 ≥199.9를 기대했다. | PLC2 명령으로 판정한다. |
-| off R | SIS 와 무관하다(15390초에 열림). keepalive 처리가 `dose 27.17`을 덮어썼다. | `stop_ai()`가 keepalive 처리를 기다린다. |
-| on R (통과였음) | ramp 가 설계보다 빨랐다(공정 90초 주기에 +3, 받은 주기에 곧바로 +2). 시험은 첫 계단을 빼고 쟀고, 기준(≤3.0, ≥210초)도 느슨했다. | plc2.py ramp 를 60초 구간 방식으로 바꿨다. 판정은 60초 구간 검사다. |
-| on H2 (통과였음) | keepalive 가 바뀐 탁도로 ⑦ 거부됐다. 대기가 길어서 연속 거부보다 stale 이 먼저 걸렸다. | keepalive 대기, 300초 대기와 120초 간격으로 바꿨다. `consecutive_rejects`를 요구한다. |
-| on H4 | 문제없다. 폴백 뒤 ⑥이 ⑦보다 먼저 걸린다. | 없음 |
-
-새 판정을 첫 실행 기록에 적용하면 on R 은 위반으로 FAIL, on H2(stale)도 FAIL, off H3 는 PASS 다(판정이 더 엄격해짐).
+- 결과: `logs/verify_security.json`. 모드별 로그 사본은 `.txt`(`logs/verify_security_{off,on}_{gateway,plc2,gateway_console}.txt`)와
+  `_process.csv`로 남긴다. `.log`로 두면 `verify_system.py`의 오류 줄 검사(`logs/*.log`)에 잡힌다.
+- 2026-11-29 실행: `verify_security.py` 18/18, `verify_system.py` 14/14 PASS.
+- 장치 로그의 Traceback 1개(`ConnectionRefusedError`)는 시작할 때 서버가 아직 안 떠서 생기는 처음 값 쓰기 재시도다.
 
 ## 알려진 한계
 
@@ -185,3 +163,6 @@ PLC2 로그의 Traceback 1개는 시작할 때 연결 거부(처음 값 쓰기 �
 - EtherNet/IP 에는 인증이 없다. 방화벽은 출발지 IP 로만 막으므로, hmi 를 장악하면(H3) PLC2 자체 검사만 남는다.
 - ⑧(1시간 누적)은 게이트웨이가 공정 1시간 넘게 돌아야 기록이 생긴다. H4(−0.3/5분 = −3.6/시간)는 ⑧이 아니라 ⑦이 잡는다.
 - 공정이 조류를 계산하지 않아, ⑦의 조류 첫날 시나리오는 실행 중인 시스템에서 재현되지 않는다.
+- 운영자 수동 모드가 없다. 게이트웨이가 AI 모드면 `hmi.py dose`로 넣은 값을 다음 통과 패킷(공정 5분 안)이 덮어쓰고,
+  폴백이면 매 주기 기준값이 덮어쓴다. 보안을 켜 두고 AI만 끄면 공정 15분 뒤 폴백한다. 직접 정하려면 둘 다 끄고 띄운다.
+- `ai_agent.py pause`/`resume`은 `DIRECT_WRITE = True`일 때만 뜻이 있어 지금은 효과가 없다(패킷은 계속 나간다).
