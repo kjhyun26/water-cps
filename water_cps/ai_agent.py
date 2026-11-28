@@ -1,12 +1,12 @@
 """AI 에이전트(AI 노드): 원수 탁도를 읽고 AI 모델로 약품 주입률 추천값을 낸다.
 
-HMI와 같은 통신 구조를 쓴다 (설계 문서 5-2절, 6절). hmi 노드에서 hmi.py 와 함께 돈다.
+HMI와 같은 통신 구조를 쓴다 (설계 문서 5-2절, 6절). ai 노드(192.168.1.60)에서 돈다.
 모델은 dataset/train_model.py 로 미리 학습한 파일을 불러온다 (ai_model.py).
 
 실행:
     python ai_agent.py               자동 추천 루프
     python ai_agent.py status        지금 탁도로 추천값을 한 번만 출력
-    python ai_agent.py pause         PLC2 쓰기 멈춤 (운영자가 hmi.py dose 로 직접 넣을 때)
+    python ai_agent.py pause         PLC2 쓰기 멈춤 (DIRECT_WRITE = True 일 때만 뜻이 있음)
     python ai_agent.py resume        PLC2 쓰기 다시 시작
     python ai_agent.py jartest 20.5  운영자가 자-테스트 결과(mg/L)를 입력
 
@@ -20,8 +20,8 @@ HMI와 같은 통신 구조를 쓴다 (설계 문서 5-2절, 6절). hmi 노드�
     추천을 낼 때마다 created_at, seq, model_version, model_hash, inputs 를 붙인 패킷을
     logs/ai_predictions.jsonl 에 한 줄씩 쓴다. 게이트웨이(보안 설계 담당)가 이 패킷으로
     시각·순번·승인 모델·입력 원본을 검사한다.
-    팀 설계는 "AI는 PLC에 바로 쓰지 못한다"이다. 게이트웨이가 생기기 전까지는 DIRECT_WRITE
-    = True 로 두어 임시로 PLC2에 직접 쓴다. 게이트웨이가 붙으면 False 로 바꾼다.
+    팀 설계는 "AI는 PLC에 바로 쓰지 못한다"이다. DIRECT_WRITE = False 라 AI는 패킷만 쓰고,
+    PLC2에는 게이트웨이(gateway.py)가 검사를 통과한 값만 쓴다.
 
 보안 조치 (보안 설계 문서 F1·H2, AI 전용 AI1·AI2):
     F1 출력 범위 검사 — 추천값이 5~50 mg/L를 벗어나면 범위 끝값으로 자른다.
@@ -52,8 +52,8 @@ from config import (
 PLC1_ADDRESS = ADDRESS['plc1']
 PLC2_ADDRESS = ADDRESS['plc2']
 
-# 게이트웨이가 생기기 전까지 임시로 PLC2에 직접 쓴다 (팀 설계 규칙은 False)
-DIRECT_WRITE = True
+# AI는 PLC2에 직접 쓰지 않는다 (팀 설계 규칙). PLC2에는 게이트웨이가 쓴다
+DIRECT_WRITE = False
 
 PAUSE_FILE = 'logs/ai_agent.pause'
 JAR_TEST_FILE = 'logs/jar_test.json'
@@ -324,4 +324,4 @@ class AiAgent(HMI):
 
 
 if __name__ == '__main__':
-    AiAgent(name='hmi', state=STATE, protocol=CLIENT_PROTOCOL)
+    AiAgent(name='ai', state=STATE, protocol=CLIENT_PROTOCOL)

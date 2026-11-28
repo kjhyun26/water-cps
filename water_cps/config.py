@@ -57,9 +57,22 @@ ADDRESS = {
     'plc2': '192.168.1.20',
     'plc3': '192.168.1.30',
     'sis':  '192.168.1.40',
-    'hmi':  '192.168.1.50',
+    'hmi':  '192.168.1.50',       # HMI 화면, 게이트웨이(gateway.py)
+    'ai':   '192.168.1.60',       # AI 에이전트(ai_agent.py). 예측값 패킷만 쓰고 PLC2에는 쓰지 않는다
+    'attacker': '192.168.1.70',   # 공격 시험용 호스트. 아무것도 띄우지 않는다
 }
 NETMASK = '/24'
+
+# 방화벽 (run.USE_SECURITY = True 일 때 각 장치 이름공간의 iptables INPUT 에 건다)
+# EtherNet/IP 포트로 새 연결을 받아도 되는 출발지. 표에 없는 출발지는 버린다(DROP).
+# lo(자기 서버에 쓰기)와 ESTABLISHED,RELATED(내가 연 연결의 응답)는 항상 허용한다.
+ENIP_PORT = 44818
+FIREWALL_ALLOWED = {
+    'plc1': ('plc2', 'hmi', 'ai'),   # PLC2는 유량, hmi(화면·게이트웨이)와 AI는 탁도·공정 시각을 읽는다
+    'plc2': ('hmi',),                # 주입률 설정값은 hmi(게이트웨이·운영자)만 쓴다
+    'plc3': ('hmi',),
+    'sis':  ('hmi',),
+}
 
 # 물리 층 태그 (이름, 장치 번호)
 SIM_TIME = ('SIM_TIME', 0)
