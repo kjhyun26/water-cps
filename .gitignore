@@ -20,4 +20,7 @@ water_cps/dataset/models/*.pkl
 water_cps/dataset/models/metrics.json
 water_cps/dataset/models/guard.json
 water_cps/dataset/models/model_info.json
+
+# 운영자 승인 목록 (gateway.py approve). 모델 해시가 학습할 때마다 달라 PC마다 만든다
+water_cps/dataset/approved_models.json
 .DS_Store
